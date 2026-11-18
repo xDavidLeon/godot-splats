@@ -1,0 +1,102 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://splats/demo/splat_demo.gd" id="1_demo"]
+[ext_resource type="Script" path="res://addons/splats/splat_scene.gd" id="2_scene"]
+[ext_resource type="Script" path="res://addons/splats/splat_instance.gd" id="3_instance"]
+[ext_resource type="Shader" path="res://addons/splats/shaders/splat_present.gdshader" id="4_present"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_present"]
+shader = ExtResource("4_present")
+
+[node name="SplatDemo" type="Node"]
+script = ExtResource("1_demo")
+
+[node name="World" type="Node3D" parent="."]
+unique_name_in_owner = true
+
+[node name="DeskSet" type="Node3D" parent="World"]
+script = ExtResource("3_instance")
+asset = "res://splats/samples/desk-set.bytes"
+
+[node name="Avatar" type="Node3D" parent="World"]
+script = ExtResource("3_instance")
+asset = "res://splats/samples/avatar-b.bytes"
+
+[node name="Mug" type="Node3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.45, 0.445, 0.02)
+script = ExtResource("3_instance")
+asset = "res://splats/samples/mug.bytes"
+
+[node name="Teapot" type="Node3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.42, 0.445, 0)
+script = ExtResource("3_instance")
+asset = "res://splats/samples/teapot.bytes"
+
+[node name="BackDesk" type="Node3D" parent="World"]
+transform = Transform3D(0, 0, -1, 0, 1, 0, 1, 0, 0, 1.75, 0, 1.3)
+
+[node name="DeskSet" type="Node3D" parent="World/BackDesk"]
+script = ExtResource("3_instance")
+asset = "res://splats/samples/desk-set.bytes"
+
+[node name="Avatar" type="Node3D" parent="World/BackDesk"]
+script = ExtResource("3_instance")
+asset = "res://splats/samples/avatar-b.bytes"
+time_offset = 1.7
+
+[node name="Mug" type="Node3D" parent="World/BackDesk"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.45, 0.445, 0.02)
+script = ExtResource("3_instance")
+asset = "res://splats/samples/mug.bytes"
+
+[node name="Camera" type="Camera3D" parent="World"]
+unique_name_in_owner = true
+projection = 1
+size = 2.3
+near = 0.1
+far = 40.0
+
+[node name="SplatScene" type="Node" parent="." node_paths=PackedStringArray("camera", "instances_root")]
+unique_name_in_owner = true
+script = ExtResource("2_scene")
+camera = NodePath("../World/Camera")
+instances_root = NodePath("../World")
+art_size = Vector2i(320, 180)
+
+[node name="Backdrop" type="ColorRect" parent="."]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.16470589, 0.12156863, 0.101960786, 1)
+
+[node name="Picture" type="TextureRect" parent="."]
+unique_name_in_owner = true
+texture_filter = 1
+material = SubResource("ShaderMaterial_present")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="Status" type="Label" parent="."]
+unique_name_in_owner = true
+offset_left = 16.0
+offset_top = 12.0
+offset_right = 1904.0
+offset_bottom = 44.0
+theme_override_font_sizes/font_size = 24
+
+[node name="LookToggle" type="CheckButton" parent="."]
+unique_name_in_owner = true
+offset_left = 16.0
+offset_top = 52.0
+offset_right = 520.0
+offset_bottom = 96.0
+focus_mode = 0
+theme_override_font_sizes/font_size = 24
+text = "Look: average  [Tab]"

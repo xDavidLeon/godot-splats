@@ -1,0 +1,806 @@
+# @shapeshift-labs/ink-studio
+
+A JavaScript toolkit for sculpting signed-distance solids, baking them into pixel-art Gaussian splats, and making them move, react, break, grow and remember what happened to them. Use it from Node, drive it through the `ink-studio` command, or embed the source bundle in an Inkwell or browser application.
+
+The package includes geometry, materials, lighting, animation, character controls, particles, physics, procedural generation, retained authoring and a headless renderer. Scene authors can use JavaScript or JSON. A host application supplies its own interactive viewport and editor interface.
+
+## Contents
+
+- [Install and run](#install-and-run)
+- [First sculpted scene](#first-sculpted-scene)
+- [Using the library in Node](#using-the-library-in-node)
+- [Scene lifecycle and splat data](#scene-lifecycle-and-splat-data)
+- [Geometry and materials](#geometry-and-materials)
+- [Scenes as JSON](#scenes-as-json)
+- [Animation and puppets](#animation-and-puppets)
+- [Particles and interaction](#particles-and-interaction)
+- [Physics and persistent effects](#physics-and-persistent-effects)
+- [Importing meshes](#importing-meshes)
+- [Exporting GLB models](#exporting-glb-models)
+- [Importing depth maps](#importing-depth-maps)
+- [Procedural worlds](#procedural-worlds)
+- [Retained authoring](#retained-authoring)
+- [Rendering and command reference](#rendering-and-command-reference)
+- [View-dependent surface materials](#view-dependent-surface-materials)
+- [Reflections, ripples and atmosphere](#reflections-ripples-and-atmosphere)
+- [Embedding and custom scene collections](#embedding-and-custom-scene-collections)
+- [Module reference](#module-reference)
+- [Validation and development](#validation-and-development)
+
+## Install and run
+
+Requires **Node 18 or later**. There are no declared runtime dependencies. The package is available from GitHub.
+
+From a checkout:
+
+```sh
+node cli/ink-studio.js help
+node cli/ink-studio.js scenes
+node cli/ink-studio.js render watcher --t 2.6
+node cli/ink-studio.js render watcher --t 2.6 --colored
+npm test
+```
+
+Install from GitHub:
+
+```sh
+npm install github:siliconjungle/shapeshift-labs-ink-studio
+npx ink-studio help
+```
+
+To install a local checkout into another project:
+
+```sh
+npm install /absolute/path/to/ink-studio
+npx ink-studio help
+npx ink-studio render watcher --colored
+```
+
+The installed package is named `@shapeshift-labs/ink-studio`, and its executable is `ink-studio`. The `private` setting prevents accidental registry publication.
+
+Generated pictures normally go into `studio/out/`. Image baselines go into `studio/snaps/`. Use `--out file.png` for an explicit output path, or configure the directories with `ink-studio.config.js`.
+
+The examples below use `npx ink-studio` from a consuming project. In this checkout, replace that prefix with `node cli/ink-studio.js`.
+
+## First sculpted scene
+
+Save this as `model.js`. A JavaScript scene exports a function receiving the toolkit and returning `{ id, name, seed, build(seed) }`. `build` returns the finished world.
+
+<!-- include: examples/sculpt.js -->
+
+```js
+module.exports = ({ makeBuilder, makeSculpt, KIT: K }) => ({
+  id: 'sculpt-example',
+  name: 'Carved stone',
+  seed: 7,
+  build(seed) {
+    const palette = [0x080b10, 0x26313d, 0x566778, 0x9baeb8, 0xe5e9dc, 0x387548, 0x8fc75e];
+    const B = makeBuilder(seed, palette);
+    const S = K.sculpt(makeSculpt(B));
+    const stone = { r: [1, 2, 3, 4] };
+
+    S.ground({ r: [1, 1, 2] }, { rad: 4, res: 0.18 });
+    S.box([0, 1.2, 0], [1, 1.2, 1], stone, { res: 0.12 });
+    S.ball([0, 1.4, 0.9], 0.65, stone, { neg: true });
+    S.ball([0, 2.7, 0], 0.5, { r: [1, 5, 6] }, { res: 0.1 });
+    S.bake();
+
+    return B.finish({
+      cam: { target: [0, 1.4, 0], dist: 12, pitch: 0.2, yaw: 0.45 },
+      detail: 14,
+      dither: 0.25,
+      radius: 5
+    });
+  }
+});
+```
+
+Render it without opening a browser:
+
+```sh
+npx ink-studio render model.js --colored
+npx ink-studio turn model.js --n 8
+npx ink-studio stats model.js
+```
+
+The same runnable scene is included as [examples/sculpt.js](examples/sculpt.js). Position vectors use `[x, y, z]`, with Y up. `S.box` takes half-extents, so `[1, 1.2, 1]` makes a box 2 units wide, 2.4 high and 2 deep. `res` is the surface sampling spacing: smaller values generally create more splats and cost more to bake and render.
+
+## Using the library in Node
+
+```js
+const studio = require('@shapeshift-labs/ink-studio');
+const { makeBuilder, makeSculpt, KIT: K, SCENES } = studio.load();
+
+const B = makeBuilder(7);
+const S = K.sculpt(makeSculpt(B));
+S.ball([0, 1, 0], 1, { r: [1, 2, 3, 4] }, { res: 0.15 });
+S.bake();
+const world = B.finish({
+  cam: { target: [0, 1, 0], dist: 10, pitch: 0.2, yaw: 0.4 },
+  detail: 14
+});
+
+console.log(world.count, world.data instanceof Float32Array);
+console.log(SCENES.map(scene => scene.id));
+```
+
+`makeSculpt(B)` creates the base sculptor. `K.sculpt(...)` adds the toolkit's extended shape operations. `load()` compiles and caches a concatenated CommonJS bundle in the package's `dist/standalone.js`; it needs a writable package directory on first use or after source changes.
+
+The package entry point exposes:
+
+| Export | Result / purpose |
+| --- | --- |
+| `load()` | `{ makeBuilder, makeSculpt, KIT, SCENES, PixelLook, VOX, ... }` ready for Node. |
+| `files()` | Absolute source paths in dependency order. |
+| `demoFiles()` | Absolute demo source paths. |
+| `bundle()` | Toolkit source as one script string, without demo scenes. |
+| `demos()` | Demo source that appends to an existing `SCENES` array. |
+| `readMesh(file)` | Read an OBJ, glTF or GLB file and its supported companion files. |
+| `exportGlb(modelOrFile, { out, ...options })` | Export indexed authoring geometry or an input mesh file as a self-contained GLB. |
+| `lint(files)` | Return lines rejected by the source comment guard. |
+| `EXPORTS` | Comma-separated names defined by the source bundle. |
+| `version` | Package version string. |
+
+`load()` also exports `basis`, `flame`, `motes`, `pondMat`, `lilies`, `courses`, `PALETTES` and `PAL_HEX`. Use the `KIT` namespace for the main authoring APIs.
+
+## Scene lifecycle and splat data
+
+1. Create the builder and sculptor with a stable seed and palette.
+2. Install hooks such as a rig, light capture or deformation tags **before** baking the solids they must capture.
+3. Add solids and call `S.bake()` to sample their surfaces, light them and write splats.
+4. Allocate particle pools, cloth, hair and other systems that emit splats **before** `B.finish()` fixes the world's data span.
+5. Finish with camera and rendering metadata.
+6. Attach a stage, puppet or other animation driver to the finished world.
+
+Bake static scenery before adding moving objects when scenery should not contain holes or baked shadows from those moving objects. The puppet example uses this pattern.
+
+A world includes `data`, `count`, `pal`, `seed`, rendering metadata, and optionally `anim`. `data` is a `Float32Array` with **16 floats per splat**:
+
+```text
+[x, y, z, density]
+[c00, c01, c02, packedRGB]
+[c11, c12, c22, kind]
+[phase, speed, range, extra]
+```
+
+The `c` values encode a symmetric covariance matrix describing the splat's shape. Use toolkit systems to modify the data when possible so covariance, color and changed-row tracking stay consistent.
+
+`K.stage(world)` installs `world.anim`. Systems run in the order added; painters combine color effects in their own addition order. A stage normalizes its clock to its first update and clamps individual simulation steps to 0.05 seconds. For reproducible simulation, initialize at zero and use fixed forward steps:
+
+```js
+const { KIT: K, SCENES } = require('@shapeshift-labs/ink-studio').load();
+const scene = SCENES.find(scene => scene.id === 'burn');
+const world = scene.build(scene.seed);
+world.anim.update(0, 0);
+for (let frame = 1; frame <= 120; frame++) {
+  world.anim.update(1 / 60, frame / 60);
+}
+```
+
+Stateful worlds need their intervening simulation steps. Rebuild them to return to an earlier time. Pure clips can be sampled directly at arbitrary times. The CLI handles forward stepping and bone projection for rendered animation.
+
+## Geometry and materials
+
+The core sculptor provides `ball`, `box`, `lathe`, `torus`, `tube`, `rock`, `ground` and vegetation helpers. The extended sculptor adds joins, folds, warps, shells, extrusion, revolution, text, grid operations and other modeling tools.
+
+This complete scene cuts a cylindrical opening through a box. `hold: true` creates operands without emitting them as separate visible solids; the join emits the combined result.
+
+```js
+module.exports = ({ makeBuilder, makeSculpt, KIT: K }) => ({
+  id: 'arch-example', name: 'Carved arch', seed: 1,
+  build(seed) {
+    const B = makeBuilder(seed);
+    const S = K.sculpt(makeSculpt(B));
+    const material = { r: [1, 2, 3, 4] };
+    const held = { hold: true };
+    const block = S.box([0, 1, 0], [1.2, 1, 0.45], material, held);
+    const opening = S.tube([[0, 0.7, -1], [0, 0.7, 1]], 0.65, 0.65, material, held);
+    S.join('cut', block, opening, { res: 0.12 });
+    S.bake();
+    return B.finish({
+      cam: { target: [0, 1, 0], dist: 10, pitch: 0.2, yaw: 0.4 },
+      detail: 14
+    });
+  }
+});
+```
+
+Useful options include `tag` for ownership, `neg` for subtraction, `ghost` for geometry that is drawn without ordinary solid occlusion, and `ax` for an orientation frame. Join kinds include `union`, `cut`, `common`, `round`, `chamfer`, `stairs`, `columns`, `pipe`, `engrave`, `groove` and `tongue`.
+
+Materials normally use palette indices in a dark-to-light ramp:
+
+```js
+const stone = { r: [1, 2, 3, 4] };
+const glow = { r: [5, 6, 7], em: true };
+const bands = { r: [1, 2, 3, 4], mod: K.tex.range(K.tex.wave(5), 0, 1, -0.2, 0.2) };
+const wax = K.look.wax([1, 2, 3, 4], { depth: 0.5 });
+const jelly = K.look.jelly([5, 6, 7], { depth: 1.3, k: 0.85 });
+const glass = K.look.glass([2, 3, 4], { a: 0.085 });
+const fur = K.look.fur([1, 2, 3, 4], { len: 0.2, droop: 0.3 });
+```
+
+This fragment assumes an existing `K` namespace and a palette containing every referenced index. Material callbacks can choose ramps, shift tones or color individual surface points. Patterns include noise, Voronoi cells, waves, bricks, checkers and gradients. Surface attributes can drive wear, grime, root shading and coats of material.
+
+See [lab/shapes.js](lab/shapes.js) and [lab/warps.js](lab/warps.js) for complete shape galleries. The [Night Cabinet demo](demos/labscenes.js) combines glass, translucency, fur and smoke.
+
+## Scenes as JSON
+
+JSON scenes describe materials by role, then a style maps each role to a palette. Built-in styles are `slate`, `moss` and `ember`.
+
+<!-- include: examples/scene.json -->
+
+```json
+{
+  "id": "json-example",
+  "name": "Floating gem",
+  "seed": 2,
+  "style": "moss",
+  "camera": { "target": [0, 1.5, 0], "dist": 12, "pitch": 0.2, "yaw": 0.4 },
+  "solids": [
+    { "kind": "ground", "mat": "earth", "rad": 4, "res": 0.2 },
+    { "kind": "ball", "at": [0, 1.8, 0], "r": 0.7, "mat": "accent", "part": "gem", "res": 0.12 }
+  ],
+  "parts": { "gem": { "joint": [0, 1.8, 0] } },
+  "motion": [
+    { "do": "spin", "part": "gem", "axis": [0, 1, 0], "speed": 0.8 },
+    { "do": "bob", "part": "gem", "amount": 0.2, "period": 3 }
+  ],
+  "tap": { "do": "sparks", "colours": "glow", "n": 12 }
+}
+```
+
+```sh
+npx ink-studio validate examples/scene.json
+npx ink-studio render examples/scene.json --t 1.5
+npx ink-studio render examples/scene.json --style ember --t 1.5
+npx ink-studio clip examples/scene.json --from 0 --to 3 --fps 12
+```
+
+Programmatic validation returns all diagnosed problems rather than only the first one:
+
+```js
+const { KIT: K } = require('@shapeshift-labs/ink-studio').load();
+const spec = {
+  id: 'small-scene', name: 'Stone', seed: 1, style: 'slate',
+  camera: { target: [0, 1, 0], dist: 10, pitch: 0.2, yaw: 0.4 },
+  solids: [{ kind: 'ball', at: [0, 1, 0], r: 1, mat: 'stone', res: 0.15 }]
+};
+const problems = K.diorama.check(spec);
+if (problems.some(problem => problem.level === 'error')) {
+  throw new Error(K.diorama.report(problems));
+}
+const world = K.diorama.build(spec);
+console.log(world.count);
+```
+
+`K.diorama.scene(spec)` wraps a specification as a scene with a `build` method. `K.diorama.kinds` exposes the supported solid fields, and `K.diorama.styles` exposes style definitions. Programmatic mesh assets go in the second argument as `{ assets: { name: mesh } }`.
+
+The larger [lab/data-shrine.json](lab/data-shrine.json) demonstrates joins, folded and warped geometry, parented parts, lights, particles and tap effects.
+
+## Animation and puppets
+
+Use `K.rig` for tagged rigid parts, `K.creature` for a creature rig, and `K.puppet` for hierarchical parts with deformation. `K.anim` provides clips, easing, layers, state machines, constraints, facial controls and presentation cues. `K.acts` provides ready-made action and reaction clips.
+
+<!-- include: examples/puppet.js -->
+
+```js
+module.exports = ({ makeBuilder, makeSculpt, KIT: K }) => ({
+  id: 'puppet-example',
+  name: 'Celebrating puppet',
+  seed: 3,
+  build(seed) {
+    const B = makeBuilder(seed);
+    const S = K.sculpt(makeSculpt(B));
+    S.ground({ r: [1, 1, 2] }, { rad: 4, res: 0.2 });
+    S.bake();
+
+    const tags = K.deform.tags(S);
+    S.ball([0, 1, 0], [0.55, 1, 0.55], { r: [1, 2, 3, 4] }, { tag: 'body', res: 0.12 });
+    S.ball([0, 2.25, 0], 0.4, { r: [5, 6, 7] }, { tag: 'head', res: 0.1 });
+    S.bake();
+
+    const W = B.finish({
+      cam: { target: [0, 1.5, 0], dist: 12, pitch: 0.15, yaw: 0.4 },
+      detail: 14,
+      dither: 0.25
+    });
+    const clip = K.acts.clip('victory', { part: 'body', unit: 0.01 });
+    K.puppet(W, {
+      react: true,
+      parts: {
+        body: { ids: tags.body, pivot: [0, 0, 0], slices: 6 },
+        head: { ids: tags.head, pivot: [0, 2, 0], parent: 'body' }
+      },
+      pose(t, dt, puppet) {
+        clip.sample(t % 2, puppet.pose);
+        puppet.look('head', [3, 2, 2], { limit: 45 });
+      }
+    });
+    return W;
+  }
+});
+```
+
+```sh
+npx ink-studio render examples/puppet.js --t 0.6
+npx ink-studio sheet examples/puppet.js --from 0 --to 2 --n 8
+npx ink-studio ghost examples/puppet.js --t 0.6 --spacing 0.12 --n 2
+npx ink-studio acts
+```
+
+Clips can also be sampled as plain pose data, independently of a world:
+
+```js
+const { KIT: K } = require('@shapeshift-labs/ink-studio').load();
+const clip = K.anim.clip({
+  dur: 2,
+  loop: true,
+  tracks: {
+    'head.rot': [[0, [0, 0, 0]], [1, [0, 30, 0], 'out-back'], [2, [0, 0, 0]]]
+  }
+});
+const pose = {};
+clip.sample(0.5, pose);
+console.log(pose.head.rot);
+```
+
+Clip pose rotations use degrees; matrix rotations and many geometry options use radians. Check the relevant module's opening API comment before combining the two.
+
+Additional animation APIs include `K.anim.machine`, `K.anim.face`, `K.anim.path`, `K.anim.steer`, `K.anim.track` and `K.anim.support`. Deformation maps include body squash/stretch, noodles, folds, lattices, morphs, smears, reaction fields, foliage and line boil. Apply maps on the CPU with `K.deform.apply`, or use puppet/bone skinning with an appropriate host renderer.
+
+`K.character(B, spec, lane)` creates an input-driven character with movement, running, jumping, dashing, attacks, casting and crouching. Its specification supplies geometry and rig points; it is a toolkit for authoring a character, rather than a bundled cast of character assets. The API is documented at the top of [kk-character.js](src/kit/kk-character.js).
+
+## Particles and interaction
+
+Allocate a pool before finishing the world. Then attach particles and emission systems to a stage:
+
+<!-- include: examples/particles.js -->
+
+```js
+module.exports = ({ makeBuilder, makeSculpt, KIT: K }) => ({
+  id: 'particles-example',
+  name: 'Embers in a current',
+  seed: 4,
+  build(seed) {
+    const B = makeBuilder(seed);
+    const S = K.sculpt(makeSculpt(B));
+    S.ground({ r: [1, 1, 2] }, { rad: 4, res: 0.2 });
+    S.ball([0, 0.4, 0], 0.4, { r: [5, 6, 7], em: true }, { res: 0.12 });
+    S.bake();
+
+    const pool = K.pool(B, 160);
+    const W = B.finish({
+      cam: { target: [0, 1.2, 0], dist: 12, pitch: 0.2, yaw: 0.4 },
+      detail: 14,
+      dither: 0.25
+    });
+    const stage = K.stage(W);
+    const particles = stage.add(K.particles(stage, pool, {
+      flow: K.flow.sum(K.flow.wind([0.3, 1, 0]), K.flow.curl(1, 0.4)),
+      ground: () => 0
+    }));
+    let next = 0;
+    stage.add({
+      update(dt, t) {
+        if (t >= next) {
+          particles.embers([0, 0.6, 0], 3, [6, 7, 5]);
+          next = t + 0.1;
+        }
+      },
+      poke(hit) {
+        if (hit) particles.sparks(hit.p, 16, [7, 6, 5]);
+      }
+    });
+    return W;
+  }
+});
+```
+
+```sh
+npx ink-studio clip examples/particles.js --from 0 --to 2 --fps 12
+npx ink-studio render examples/particles.js --t 1.2 --poke '1:0,0.4,0'
+```
+
+A stage's `poke(eye, direction)` picks the surface and dispatches the result to systems with a `poke` method. `--poke` scripts the same interaction for headless commands; separate multiple timed taps with semicolons and quote the entire value.
+
+Particle helpers include `dust`, `sparks`, `embers`, `smoke`, `chips`, `ring`, `bolt` and `rain`. `emit` exposes velocity, lifetime, gravity, drag, size, palette colors and flow response. Flow fields can combine wind, curl, vortices and sinks; `K.flow.around(flow, sdf, margin)` turns a current along solid boundaries.
+
+### Frame-local splat effects
+
+Use `K.frameSplats(B, capacity, render)` for effects whose geometry is redrawn each frame. Reserve the splats before `B.finish()` and attach the system with `stage.add(frame)`. The stage calls `render(draw, dt, time)` each update, and the system hides any rows left over from the previous frame. It can share a stage with `K.particles`.
+
+```js
+const model = K.frameSplats.capture(modelWorld, [0, 0, 0]);
+const frame = K.frameSplats(B, model.count + 48, (draw, dt, time) => {
+  const stretch = 1 + 0.5 * K.wobble(time / 0.8);
+  draw.model(model, [2, 1, 0], { matrix: K.M.stretch([0, 1, 0], stretch, true) });
+  draw.vortex([0, 0, 0], { phase: time * 4, radius: [0.2, 1.2], color: 3 });
+});
+const W = B.finish({ /* scene metadata */ });
+K.stage(W).add(frame);
+```
+
+- `capture(world, origin)` snapshots the visible splats around a local origin. Instances reuse the baked colors, densities and shapes. Surface material tables and shader motion are outside the snapshot.
+- `draw.model(model, at, { matrix, opacity })` sends the local origin to `at` and transforms both centers and covariance with a row-major 3×3 matrix. Defaults are the identity matrix and opacity 1.
+- `draw.streak(a, b, { width, color, density, emissive })` draws one splat. Width is a world-space half-width, and color is an index into the scene palette. Defaults are `0.04`, `1`, `2`, and `true`.
+- `draw.vortex(center, options)` draws `arms * segments` streaks. It accepts the streak options plus `axis` (Y up), `radius` (one radius or a base and tip pair), `height`, `turns`, `phase` in radians, `arms` (3), and `segments` per arm (16). Animate `phase` for rotation or vary `radius`, `height`, and `density` for a transition.
+
+Each draw call returns `false` and leaves the current frame intact if the whole effect can’t fit. `K.wobble(t, cycles = 2)` returns a signed, decaying offset over normalized time. Use `K.ease.back` for a single overshoot and `K.ease.elastic` for easing into a target with an oscillation.
+
+The [splat effects example](examples/splat-effects.js) shows both effects together.
+
+```sh
+npx ink-studio clip examples/splat-effects.js --from 0 --to 1.5 --fps 12
+```
+
+## Physics and persistent effects
+
+There are several simulation levels:
+
+| API | Use |
+| --- | --- |
+| `K.breaker`, `K.rubble`, `K.debris` | Breaking, unsupported pieces, falling rubble and loose fragments. |
+| `K.jelly`, `K.sand` | Lightweight shape deformation or granular motion. |
+| `K.mpm` | A material-point solver for elastic jelly, yielding clay, granular sand and water. |
+| `K.sandbox` | A cellular material simulation with fluid flow, heat, phase changes and reactions. |
+| `K.inside` | Interior splats revealed by bites and cuts. |
+| `K.xpbd.sim`, `K.cloth`, `K.hair` | Constraint-based points, cloth and groomed strands with pins, collisions and wind. |
+| `K.xpbd.rope`, `K.xpbd.carry`, `K.xpbd.blades` | Ropes, chains, objects carried by simulated points, kelp and reeds. |
+| `K.voxels` | Persistent per-cell channels, spreading fire/frost/growth, and support queries. |
+
+Use `K.sandbox.grid({ at, size, cell })` to set up a material grid. Add volumes with `grid.box(lo, hi, material)` and assign sculpted surfaces with `grid.walls(S.sdf, { as: 'stone' })`. Pass `grid.spec()` as `sandbox` when finishing the world, then use `K.sandbox.attach(world)` to add the simulation to the scene. Browser hosts can supply a worker that runs `K.sandbox.serve(self)`.
+
+A complete cloth scene:
+
+<!-- include: examples/cloth.js -->
+
+```js
+module.exports = ({ makeBuilder, makeSculpt, KIT: K }) => ({
+  id: 'cloth-example',
+  name: 'Cloth in the wind',
+  seed: 1,
+  build(seed) {
+    const B = makeBuilder(seed);
+    const S = K.sculpt(makeSculpt(B));
+    S.ground({ r: [1, 1, 2] }, { rad: 4, res: 0.2 });
+    S.bake();
+
+    const cloth = K.cloth(B, {
+      at: [-1, 3, 0],
+      u: [2, 0, 0],
+      v: [0, -2, 0],
+      nu: 12,
+      nv: 10,
+      pins: (i, j) => j === 0,
+      wind: K.xpbd.gust([2, 0, 1]),
+      pattern: (u, v) => (Math.floor(u * 6) + Math.floor(v * 6)) % 2 ? [1, 2, 3] : [5, 6, 7],
+      sdf: S.sdf
+    });
+    const W = B.finish({
+      cam: { target: [0, 1.5, 0], dist: 12, pitch: 0.2, yaw: 0.5 },
+      detail: 14,
+      dither: 0.25
+    });
+    K.stage(W).add(cloth);
+    return W;
+  }
+});
+```
+
+```sh
+npx ink-studio render examples/cloth.js --t 1
+npx ink-studio clip stuff --from 0 --to 3 --fps 12
+npx ink-studio render idol --t 2 --poke '1:0,2,0'
+```
+
+For persistent effects, use an existing sculpted `S` and finished world's `stage`:
+
+```js
+const voxels = K.voxels(stage, { cell: 0.4, sdf: S.sdf });
+stage.add(voxels.fire({ look: { flame: [6, 7], soot: [1] } }));
+stage.add(voxels.frost({ look: { pale: [3, 4] } }));
+voxels.brush('heat', [0, 1, 0], 0.8, 1);
+const heat = voxels.get('heat', 0, 1, 0);
+```
+
+The channels are created on demand. Fire behavior depends on the sampled scene's fuel/material properties. See `burn` for fire and frost, `idol` for destruction, `bench` for the lightweight solvers, and `stuff` for the material-point solver.
+
+## Importing meshes
+
+```sh
+npx ink-studio mesh lab/assets/totem.obj --size 5 --cells 64 --res 0.1
+npx ink-studio turn lab/mesh.js --n 8
+npx ink-studio render model.glb --size 6 --up z
+```
+
+Programmatic import:
+
+```js
+const studio = require('@shapeshift-labs/ink-studio');
+const { makeBuilder, makeSculpt, KIT: K } = studio.load();
+const mesh = K.mesh.fit(studio.readMesh('lab/assets/totem.obj'), { size: 5 });
+const look = K.mesh.look(mesh, { hues: 5, shades: 4 });
+const B = makeBuilder(1, look.pal);
+const S = K.sculpt(makeSculpt(B));
+S.mesh(mesh, look, { cells: 64, res: 0.1 });
+S.bake();
+const world = B.finish({
+  cam: { target: [0, 2.5, 0], dist: 15, pitch: 0.2, yaw: 0.4 },
+  detail: 14
+});
+console.log(world.count);
+```
+
+The file example assumes the current working directory is this repository. OBJ supports a companion MTL; glTF supports companion buffers; GLB is read from binary data. Material and vertex colors become palette ramps. Texture images are not imported. Open meshes become sheets with thickness. Imported geometry becomes a distance-field solid, so it can join, be carved, receive materials and break like authored geometry.
+
+## Exporting GLB models
+
+```sh
+ink-studio export-glb examples/puppet.js --out celebrating-puppet.glb
+ink-studio export-glb lab/data-shrine.json --out shrine.glb
+ink-studio export-glb path/to/model.obj --out model.glb
+```
+
+The exporter uses Ink Studio and the Node standard library. It preserves self-contained GLBs byte-for-byte and embeds local companion buffers and textures when packing glTF. OBJ conversion retains authored corner UVs, normals, and basic PNG or JPEG diffuse maps. Authored geometry with missing UVs receives a packed unwrap.
+
+- **Body topology.** `KIT.model.fromSculpt(S, options)` captures the finite rest field before `S.bake()`. It builds a dense source mesh and simplifies it with the built-in indexed edge-collapse tool. Part seams, geometric error and optional cross-section guides constrain simplification. Set `--res` to control the source pitch and `--triangles` to set a target. Protected features can keep the input above the target. In JavaScript, pass `guides: [{ center, axis, radius }]` to add edges around a section, or supply a fitted `topology: { points, faces, uvs }` to control the final edge flow and UV seams directly.
+- **Rest fields.** `KIT.model.fromSdf(field, { bounds })` accepts a signed function or a bounded field object. The field must stay positive on the box boundary. Extraction tries a quad surface first, with indexed tetrahedra for ambiguous cases. The optional `--method` accepts `surfaceNets`, `dualContour`, `adaptive` or `tetrahedra`. Use `--bounds xmin,ymin,zmin,xmax,ymax,zmax` to tighten the static bounds of a JSON diorama.
+- **Details and fur.** Give a torus or ellipsoid `model: { separate: true, name }` in its sculpt options to export it at its own resolution. This also works for emissive ellipsoids authored as ghost shapes. In JSON use `separate: true` on a ball or torus and put material channels under `mat.model`. Authored fur grows solid locks and curved cutout cards from the coat's length, comb direction, droop, clumping and palette. The optional `fur: { density, maxLocks }` controls its budget and `fur: false` produces a bare mesh.
+- **Materials.** The baker places padded UV charts on the runtime mesh and samples the rest field per texel. It can embed base color, tangent-space normals, metallic/roughness, and emission. An authored material can set these channels through `model: { color, roughness, metallic, emission, normal }` or a `model(point, normal)` function. Color and emission use linear RGB. Texture sizes range from 256 to 4096 in powers of two. Set `--texture-size 0` to export palette materials. View-dependent splat lighting, particles and per-pixel decals are handled by the splat renderer.
+- **Animation.** A JavaScript scene can return its indexed mesh or a `{ meshes, joints, animations }` model from `model(seed, options)`. Use `KIT.model.fromPuppet(mesh, puppet, { clips })` to sample a tagged puppet or `KIT.model.fromCreature(mesh, creature, { clips, parents, bones, weightZones })` with a bound creature. Creature splits provide per-region weights. Optional `weightZones: [{ center, radius, a, b, axis }]` blend adjacent regions around joints. Fur uses the weights at its roots. A model uses its authored rig for joint names, weights, and clips. JSON dioramas can export rigidly weighted parts from their motion data. `--duration` and `--fps` control sampling where the scene exposes those options.
+
+A custom indexed mesh supplies `points` and triangle or quad `faces`. It may provide linear RGB `colors` per point, face-corner `uvs`, `materials: [{ name, color }]` and a material index per face in `faceMaterials`. A model joint has `{ name, parent, head, tail }` with the parent index preceding its children. Each skinned mesh supplies a list of `[jointIndex, weight]` pairs per vertex. Use `static: true` for scenery. The writer keeps and normalizes the four strongest weights. Each custom clip supplies `frames: [{ time, matrices }]` beginning at time zero. Matrices are rest-to-pose transforms in world space, with nine row-major linear components followed by XYZ translation. The export uses a pair of nodes when a sampled affine transform needs shear.
+
+## Importing depth maps
+
+`ink-studio depth` converts a grayscale PNG or numeric depth map into Gaussian splats, a backed signed-distance field and an OBJ mesh. Add an aligned RGB or RGBA PNG with `--image` to project its colour onto the observed surface. `KIT.depth.fromMap()` gives scene authors the same conversion and accepts typed arrays directly. See the [depth import guide](docs/depth-maps.md) for camera calibration, output formats, and converting a signed field back into mesh geometry or splats.
+
+## Procedural worlds
+
+`KIT.procedural` runs in Node and in the plain-script browser bundle. Its tools work with signed fields, voxel grids, curves and placements. Feed those results into the sculptor, material pipeline or stage, or extract a mesh for preview or interchange. The [procedural API guide](docs/procedural.md) documents signatures, options and runnable examples.
+
+| Area | Available tools | Guide |
+| --- | --- | --- |
+| Noise and scalar fields | Seeded simplex noise and analytic derivatives, ridged and billow noise, anisotropic noise, domain warps, periodic and looped noise, terraces, distance fields and serializable composition for displacement, masks and placement. | [Composable fields](docs/procedural.md#composable-procedural-fields) |
+| Sampling and placement | Poisson disk with variable radius and anisotropy, chunk-stable spacing and species exclusion, progressive sample elimination, Lloyd relaxation, stratified surface sampling, geodesic spacing and curvature weighting. | [Stable spacing](docs/procedural.md#stable-spacing-and-finite-poisson-sampling), [Progressive samples](docs/procedural.md#progressive-samples-and-surface-detail) |
+| Terrain, rivers and habitats | Depression filling and breaching, D8 and D-infinity drainage, catchments and stream order, channel incision, meanders and cutoffs, levees and floodplains, marching-squares shorelines and climate and habitat fields. | [Watersheds](docs/procedural.md#watersheds-and-river-networks), [River editing](docs/procedural.md#river-editing-and-habitats) |
+| Routes, networks and settlements | Terrain-aware A* with slope and clearance, visibility paths and clearance-tested splines, fast-marching travel times, Delaunay networks and minimum spanning trees, Steiner approximations, tensor and agent-grown streets, frontage parcels and medial paths. | [Terrain routes](docs/procedural.md#terrain-routes-between-pins), [Branching networks](docs/procedural.md#triangulation-and-branching-networks), [Street systems](docs/procedural.md#street-systems-parcels-and-medial-paths) |
+| Buildings and construction | Split, repeat and inset grammars with pinned bays, fitted courses and ribbons, panel frames and attachment slots, dimensioned socket assemblies, load paths, damage rules, adjacency floor plans and packing, signed footprint offsets and weighted roofs with per-edge pitches. | [Shape grammar](docs/procedural.md#shape-grammar-and-pinned-bays), [Socket assemblies](docs/procedural.md#socket-assemblies-supports-and-damage), [Weighted roofs](docs/procedural.md#footprints-and-weighted-pitched-roofs) |
+| Constraints and layouts | Socket-constrained and overlapping Wave Function Collapse, constraint propagation and backtracking with pins, Wang and hierarchical tiling, grid and graph rewrite rules, binary space partitioning and connected cellular caves. | [Socket tiling](docs/procedural.md#socket-tiling-and-learned-swatches), [Rewriting](docs/procedural.md#grid-and-graph-rewriting), [Rooms and caves](docs/procedural.md#rooms-caves-and-packing) |
+| Growth and ecology | Stochastic, parametric L-systems with environmental inputs, branching across surfaces, leaf venation, moisture-aware roots, pipe-model taper, diffusion-limited aggregation, grid and surface Gray–Scott patterns, seed dispersal and succession. | [Vegetation](docs/procedural.md#vegetation-and-colony-patterns), [Surface growth](docs/procedural.md#surface-growth) |
+| Sculptural forms and fracture | Superquadrics, profile lofts, medial skeletons, mirrored and radial grammars, gyroid and other periodic solids, variable shells, weighted anisotropic fracture, stress-guided cracks and progressive bond failure. Bake bounded forms with `S.implicitForm`. | [Implicit forms](docs/procedural.md#implicit-forms), [Fracture](docs/procedural.md#implicit-fracture-and-crack-paths) |
+| Pixel materials | Curvature and occlusion wear, contact masks and runoff streaks, triplanar and tangent-aligned patterns, object-anchored thresholds with pixel-footprint filtering, perceptual ramps, distance outlines, swatch quilting, PatchMatch fills and void-and-cluster dither. | [Contact fields](docs/procedural.md#contact-fields-runoff-and-contours), [Material mapping](docs/procedural.md#material-mapping-ramps-and-distance-ink), [Swatch synthesis](docs/procedural.md#swatch-synthesis-and-threshold-ranks) |
+| Geometry and level of detail | Euclidean distance transforms, signed-field reinitialization, polygon triangulation with holes and constrained Delaunay, Surface Nets, dual contouring, adaptive octrees and stitched voxel levels, quadric mesh simplification and guarded Gaussian splat merging. | [Dual surfaces](docs/procedural.md#dual-surface-samples-and-reinitialization), [Adaptive levels](docs/procedural.md#adaptive-voxel-levels), [Preview reduction](docs/procedural.md#preview-reduction) |
+| Motion and persistent changes | Streamlines and signed-obstacle wakes, closed trajectories, splat advection on deforming surfaces, stable fluids and shallow water, wetness and drying, temperature and exposure, snow and frost, material state graphs and transport-based morphs. Ground traversal, ambient roaming and a scene clock support live worlds. | [Currents](docs/procedural.md#currents-and-surface-motion), [Fluids](docs/procedural.md#fluid-grids), [Weather and materials](docs/procedural.md#weather-and-retained-materials), [Splat transport](docs/procedural.md#splat-transport) |
+
+Run [terrain routing](examples/terrain-route.js), [a weighted roof](examples/weighted-roof.js), [texture synthesis](examples/texture-synthesis.js), or [a transport morph](examples/transport-morph.js) from the checkout.
+
+```sh
+node cli/ink-studio.js render examples/weighted-roof.js --seed 1 --ortho --colored
+```
+
+Higher-level scene helpers include:
+
+- `K.curve` and `K.sweep`: paths, ribbons, leaves, planks and swept profiles.
+- `K.grow`: surface-aware scattering, branching, species variation, instancing, rocks, creepers and spreading patches.
+- `K.form`: crystals, geodes, basalt columns, stalactites, flowstone, icicles, layered rock, plants and creature parts.
+- `K.erode`: hydraulic erosion and thermal slides over a height field.
+- `K.fracture`: Voronoi fracture cells with placement and settling helpers.
+- `K.build`: fitted pillars, fences, stairs, arches and pipes; recipes and attachment sockets.
+- `K.weather`: falling rain, snow and leaves; `K.form.drifts` and `K.form.frost` add accumulated snow and frost patterns.
+- `K.flock`: birds, fish and fireflies; `K.morph` blends two splat shapes over time.
+
+For example, in a scene with `K`, `S` and a suitable palette:
+
+```js
+const places = K.grow.scatter(S, { disc: [0, 0, 4], n: 12, gap: 0.6, seed: 8 });
+const species = K.grow.species({
+  name: 'stone',
+  vary: { size: [0.15, 0.4] },
+  make(S, at, values) {
+    S.ball(at, values.size, { r: [1, 2, 3, 4] }, { res: 0.12 });
+  }
+});
+species.sow(S, places);
+S.bake();
+```
+
+Use `ink-studio catalog <words>` to search catalog entries and follow their `where` fields to the implementation.
+
+## Retained authoring
+
+`KIT.authoring.document` stores scene intent as JSON with stable IDs, deterministic seeds, transactions, undo and redo, and an optional autosave adapter. Generated parts can keep hand edits across regeneration. They can also be suppressed or promoted to independent entities.
+
+`KIT.authoring.context` adds spatial queries, raycasts, named surface anchors, transform resolution, and rules that respond to changes in related entities. `KIT.authoring.groups` supports batch transforms, copying, deletion and named selections. `KIT.procedural.chunks` rebuilds affected preview or final chunks and cancels superseded work. See the [retained authoring API](docs/procedural.md#optional-retained-authoring), [incremental realization](docs/procedural.md#incremental-realization) and [runnable example](examples/procedural/authoring-example.js).
+
+## Rendering and command reference
+
+| Command | Purpose |
+| --- | --- |
+| `help` | Print supported commands and options. |
+| `scenes` | List scenes from the default demos or configured collection. |
+| `catalog [words] [--full]` | Search feature names, descriptions and tags. |
+| `acts` | List action clips, reactions, easing names and cues. |
+| `render <scene> --t 1.5` | Render one PNG at a chosen time. |
+| `sheet <scene> --from 0 --to 3 --n 12` | Make a labeled sheet of animation frames. |
+| `turn <scene> --n 8` | Make a sheet from multiple viewing angles. |
+| `clip <scene> --from 0 --to 3 --fps 12` | Save an animated PNG. |
+| `ghost <scene> --t 1 --spacing 0.12 --n 2` | Overlay neighboring animation poses. |
+| `mesh <file.obj\|.gltf\|.glb>` | Import, inspect and render a mesh from multiple angles. |
+| `depth <map.png or map.json> [--image color.png]` | Build a splat preview, signed field and OBJ from a depth map. |
+| `validate <file.json>` | Report scene-data errors and suggestions. |
+| `ramps <scene>` | Inspect the scene's color ramps. |
+| `values <scene>` | Check readability in dark, middle and light tones. |
+| `crisp <scene>` | Measure isolated pixels, fine detail, edges and palette use. |
+| `lint <scene>` | Flag pixel-art artifacts such as jaggies, banding and pillow shading. |
+| `review <scene>` | Save a contact sheet of fixed camera views and report lint for each. |
+| `shimmer <scene> --mode orbit` | Measure pixels that change and quickly change back across frames, and save a GIF. |
+| `compare <scene> <ref.png>` | Render the scene alongside a reference and measure both at the reference's pixel size. |
+| `export-glb <scene or mesh>` | Export indexed mesh geometry, UVs, materials, and available skins and clips. |
+| `paint export <scene>` | Export `paint.png` and the surface coordinates of the rendered view. |
+| `paint absorb <scene>` | Convert edited pixels in `paint.png` into surface-pinned decals. |
+| `paint clear <scene>` | Clear the scene's saved decals. |
+| `stats <scene>` | Report splat counts, extents, palette use, build and animation costs. |
+| `perf <scene> --secs 5 --fps 60` | Measure animation work and changed-data upload estimates. |
+| `motion <scene> --from 0 --to 3` | Inspect speed, jumps, low points, still regions and loop error. |
+| `snap <scene\|all> --t 0,2` | Save exact rendered baselines. |
+| `check [scene ...]` | Re-render and compare to saved baselines. |
+| `selftest` | Run numerical toolkit and demo checks. |
+
+`<scene>` can be a built-in scene ID, a JavaScript scene file, a JSON scene file or a supported mesh file. The built-in IDs are `watcher`, `burn`, `idol`, `bench`, `stuff`, `cabinet` and `rehearsal`.
+
+Common rendering controls:
+
+| Option | Effect |
+| --- | --- |
+| `--t`, `--from`, `--to`, `--n`, `--fps` | Time, frame count and sampling rate, depending on command. |
+| `--yaw`, `--pitch`, `--zoom`, `--target x,y,z` | Camera controls; angles are radians. |
+| `--ortho` | Use a parallel projection. |
+| `--edges off` | Hide the edge sprites attached to materials in a per-pixel scene. |
+| `--surface off` | Render without the view-dependent finish layers. |
+| `--reflections off` / `--atmosphere off` | Toggle planar captures or atmosphere volumes. |
+| `--w`, `--h`, `--out` | Output viewport size and destination. The renderer resolves a lower-resolution pixel grid derived from the scene's detail settings. |
+| `--px 2` | Use two screen pixels per art pixel. In `compare` and `review`, `--px` specifies the scale of the reference. |
+| `--tone stipple\|off` | Enable the stipple preset or turn off the scene's tone settings. |
+| `--seed` | Override the scene seed. |
+| `--colored` | Use palette-aware smoothing of silhouettes and body-colored contours. |
+| `--raw` | Bypass palette styling. |
+| `--fine` | Bake surface detail tiles for per-pixel color lookup. |
+| `--bounce` | Bake indirect lighting. |
+| `--focus x,y,z,near,far,coarse` | Concentrate surface detail around a point. |
+| `--follow` | Align splat shapes along the surface form. |
+| `--clean` | Remove isolated pixels in the final pass. |
+| `--style slate\|moss\|ember` | Change a JSON scene's style. |
+| `--poke '1:x,y,z;2:x,y,z'` | Script timed taps into a simulated scene. |
+
+The default look uses palette quantization and dithering. `--colored` preserves native interior detail while smoothing silhouettes; it does not fit a new palette every frame. `PixelLook` exposes shared CPU and shader helpers for hosts implementing the same look.
+
+Use `finish.look.tone` for a luminance-based palette with a black cutoff, ordered or seeded blue-noise dither, and explicit color stops. The [pixel look guide](docs/pixel-look.md) covers the stipple preset, art-pixel size and browser integration. The [stipple example](examples/stipple.json) pairs it with a keyframed surface light.
+
+For per-pixel materials, set `S.pixel = true` before baking and finish the world with `look: { pixel: true }`. `K.pixel` provides surface patterns such as turf, masonry and shingles. Use `K.pixel.edge(material, { up: 'grass', every: 5, share: 0.55 })` to attach sprites that follow the surface as the camera moves. `K.sprite.art` accepts text art for custom sprites, and `K.props` can scatter small objects along paths and at wall bases.
+
+`paint export` and `paint absorb` work with per-pixel scenes. By default, files live in `studio/paint/<scene-id>/`, where `<scene-id>` is the ID returned by the scene. Edit `paint.png` in the scene palette and use magenta (`#ff00ff`) to erase earlier paint. If you choose a custom folder with `--dir`, pass the same folder to `paint` and `render`.
+
+## View-dependent surface materials
+
+`KIT.surface` adds finishes to ordinary sculpt materials. The builder records which finish and surface normal a splat uses. The renderer evaluates the layers with the current camera and light direction, so orbiting needs no rebake. You can use the 40 named presets as supplied, override an individual layer, or compose your own finish. See the [surface material guide](docs/surface-materials.md) for the full preset list, options, JSON examples, and rendering commands.
+
+## Reflections, ripples and atmosphere
+
+Use `K.reflection` for planar captures of scene geometry, `K.ripple.field` for timed ring sources, and
+`K.atmosphere` for height fog, local mist and light shafts. The [scene optics guide](docs/scene-optics.md)
+shows the core APIs and a runnable pool scene. The [depth import guide](docs/depth-maps.md) covers
+`K.sdf.toMesh`, `K.sdf.solid` and `K.sdf.toSplats`.
+
+## Embedding and custom scene collections
+
+The browser-facing toolkit sources are plain scripts concatenated in dependency order. Generate a bundle from Node:
+
+```js
+const fs = require('node:fs');
+const studio = require('@shapeshift-labs/ink-studio');
+fs.writeFileSync('ink-studio.browser.js', studio.bundle());
+```
+
+The bundle defines `makeBuilder`, `makeSculpt`, `KIT`, `PixelLook` and the other names in `studio.EXPORTS` in script scope. It includes no DOM interface or complete interactive WebGL viewport. A host supplies rendering, calls `world.anim.update(dt, time)`, handles input, and uses changed-row and bone data as appropriate. The included software renderer is used by the CLI.
+
+To append the demos to a browser script, write `const SCENES = [];` after the toolkit bundle and append `studio.demos()`. Keep source files in the order returned by `files()` when embedding individually.
+
+For a consuming project's own scene collection, save `ink-studio.config.js` in that project's working directory:
+
+```js
+module.exports = {
+  load() {
+    const kit = require('@shapeshift-labs/ink-studio').load();
+    return { ...kit, SCENES: [require('./model.js')(kit)] };
+  },
+  out: 'studio/out',
+  snaps: 'studio/snaps'
+};
+```
+
+Then `ink-studio scenes`, `render`, `snap` and other commands operate on that collection. The load callback returns the toolkit exports alongside `SCENES`.
+
+## Module reference
+
+| File in `src/` | Main responsibilities |
+| --- | --- |
+| `builder.js` | Seeded generation, palettes, low-level splat emission and world buffers. |
+| `sculpt.js` | Base distance-field solids, materials, surface attributes, sampling and baking. |
+| `pixel-look.js` | Palette-aware pixel resolve and shader helpers. |
+| `surface-look.js` | Reusable view-dependent finish evaluation and splat metadata format. |
+| `scene-optics.js` | Reflected camera transforms, normal slopes and ray integration through atmosphere. |
+| `kit/k0-math.js` | Vectors, matrices, easing, keyed values and springs. |
+| `kit/k1-stage.js` | Stage, painter stack, rigs, pools, selection, sockets and bones. |
+| `kit/k2-motion.js` | Spines, IK, clips, state machines, ropes and gait. |
+| `kit/k3-shapes.js` | Joins, folds, warps, outlines, extrusion and revolution. |
+| `kit/k4-art.js` | SVG/pixel artwork on solid faces. |
+| `kit/k5-fields.js` | Spatial fields, tint, displacement, reveal and grading. |
+| `kit/k6-voxels.js` | Persistent channels, fire, frost, growth and support detection. |
+| `kit/k7-particles.js` | Particles, emitters and flow fields. |
+| `kit/k8-light.js` | Captured lighting, moving lamps, shadows and relighting. |
+| `kit/k9-matter.js` | Support, rubble, debris, breaking, jelly and sand. |
+| `kit/ka-build.js` | Fitted procedural construction and sockets. |
+| `kit/kb-mesh.js` | Mesh readers, fitting, palette conversion and mesh solids. |
+| `kit/kc-data.js` | JSON scene schema, validation, styles and building. |
+| `kit/kd-mpm.js` | Material-point simulation and interior filling. |
+| `kit/ke-volume.js` | Translucency, glass, fur, smoke, mist and light shafts. |
+| `kit/kf-creature.js` | Creature rigging. |
+| `kit/kg-play.js` | Gameplay particles, debris and ground ecology. |
+| `kit/kh-animate.js` | Pose clips, layers, machines, controls, faces and presentation. |
+| `kit/ki-deform.js` | Point maps, skinning, puppets and constraints. |
+| `kit/kj-acts.js` | Action clips, reactions, impact timing and secondary motion. |
+| `kit/kk-character.js` | Controllable characters, combat and animation overlays. |
+| `kit/kl-vox.js` | Letter-grid model authoring. |
+| `kit/km-ramp.js` | Palette ramp construction and hue shifts. |
+| `kit/kn-effects.js` | Window light, reflections, shatter and dissolve. |
+| `kit/kn-frame-splats.js` | Frame-local strokes, model instances and vortices. |
+| `kit/ko-grow.js` | Scattering, species, branching, instancing and iterative growth. |
+| `kit/kp-curve.js` | Curve construction, sampling and sweeping. |
+| `kit/kpx-pixel.js` | Per-pixel material patterns and pixel-sized geometry. |
+| `kit/kpy-props.js` | Seeded prop placement and reusable prop libraries. |
+| `kit/kpz-sprite.js` | Text and procedural sprite art with surface anchors. |
+| `kit/kq-surface-presets.js` | Named settings for brushed finishes, fabrics, coatings, and glints. |
+| `kit/kq-sandbox.js` | Material grid simulation and worker integration. |
+| `kit/kr-tex.js` | Procedural texture fields and remapping. |
+| `kit/ks-xpbd.js` | Constraint solver, cloth, hair and wind. |
+| `kit/kt-nodes.js` | Text, engraving, displacement and distance-grid processing. |
+| `kit/ku-motion.js` | Simulated ropes, chains, carried objects, blades, flocks and morphing. |
+| `kit/kv-form.js` | Crystals, geodes, columns and cave formations. |
+| `kit/kw-erode.js` | Fracture, erosion, strata, mud and loose stone. |
+| `kit/kx-life.js` | Plants, shells, horns, antlers, ribs, feathers, scales and tentacles. |
+| `kit/ky-built.js` | Masonry walls, worn steps and fences. |
+| `kit/kz-weather.js` | Falling weather, snowdrifts and frost. |
+| `kit/p*.js` | [Procedural fields, geometry, layouts, materials, motion and retained authoring](docs/procedural.md). |
+
+Other directories:
+
+- `cli/`: command dispatch, software rendering, PNG/APNG encoding and self-tests.
+- `demos/`: the seven bundled interactive dioramas.
+- `examples/`: small runnable scenes corresponding to this guide.
+- `lab/`: larger shape experiments, mesh examples and the data-driven shrine.
+- `tests/`: unit tests for rendering, procedural tools, authoring and simulation.
+- `scripts/`: source checks and formatting support.
+- `catalog.json`: searchable descriptions of features available in this package.
+- `storage-retention.json`: exact retained inputs and disposable generated outputs.
+
+## Validation and development
+
+```sh
+npm test
+npm run lint
+node cli/ink-studio.js validate examples/scene.json
+node cli/ink-studio.js render examples/sculpt.js --colored
+node cli/ink-studio.js snap watcher --t 0,2
+node cli/ink-studio.js check watcher
+```
+
+`npm test` runs the unit tests and the CLI self-checks for the toolkit and simulated demos. `npm run lint` checks for source-like statements after `//` that would be silently commented out. Put usage examples in block comments.
+
+Visual baselines are created explicitly by `snap`; no baseline images are bundled. `check` compares rendered pixels against those baselines. Keep baselines when they provide useful regression evidence; generated previews and the compiled `dist/` bundle can be regenerated.
+
+The package is currently version `0.1.0` and marked private.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

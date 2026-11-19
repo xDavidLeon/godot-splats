@@ -29,6 +29,7 @@ Then, with a Godot 4.7 binary (the standard build is enough; exporting needs its
                                                                     window, and a room's assets given with --samples
     godot --path <folder> -s res://splats/tools/splat_wardrobe_report.gd   eight looks and every clip; needs a window
     godot --path <folder> -s res://splats/tools/splat_fx_report.gd  particles, marks and the debug panel; needs a window
+    godot --path <folder> -s res://splats/tools/splat_tint_report.gd   a tinted instance; needs a window
 
 --overlay makes the project for the transparent click-through window: its main scene is the overlay
 and it has the two project settings that window needs, which are read at start-up. Run it with

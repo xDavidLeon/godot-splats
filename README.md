@@ -143,6 +143,30 @@ scene.set_marks(lines)      # every frame if you like; set_marks([]) takes them 
 - **Only the pixels a line covers change, nearly.** An art pixel shows a line when two or more of its four samples are the line's. With one, that sample goes through the pixel look with the others, so a pixel at a line's edge can take another palette colour: in the picture above the lines changed 3,804 pixels, and 998 of those took a colour that is not a line's. The Unity renderer does the same.
 - What lines mean is the caller's business: the addon knows nothing of grids, selections or furniture.
 
+## A tint
+
+An instance can be drawn in one colour instead of its own, on every other art pixel, so that what is behind it shows through: a thing that is not there yet, in one colour where it may go and in another where it may not.
+
+```gdscript
+thing.tint = Color8(89, 217, 115)
+thing.tinted = true           # false again draws it as itself
+thing.casts_shadow = false    # if it should not darken the floor either
+```
+
+- **The tint is shaded by each splat's own colour,** so the thing's shape still reads: a splat is drawn in the tint times 0.55 + 0.7 × how light its own colour is (0.30 of its red, 0.55 of its green, 0.15 of its blue), which is 0.55 of the tint on black and 1.25 on white, no channel going over 1. `SplatInstance.tint_shade` is the same rule in script. Any colour will do, black too.
+- **It takes every other art pixel:** the ones whose column and row, counted from the top left, add up to an even number. The pixels between are what is behind it, as they would be without it. Where nothing is behind, they stay clear.
+- **Its colour is its own, as a mark's is.** The pixel look shows it as it is, outside the palette and never inked, and every pixel of the picture is still covered or clear (measured in each renderer: of 57,600 pixels of `dev/comparisons/tint.png` before it was scaled up, none has an alpha other than 0 or 255, with floor shadows and marks as well).
+- **A tint rebuilds nothing.** It is four numbers in the instance's row, so it can be given, changed and taken away every frame.
+- **Nothing else about the instance changes, and the rest is the caller's choice:**
+  - It darkens the floor while its `casts_shadow` is on, which is the default for every instance. Turn it off for a thing that is not there yet.
+  - Lamps and dusk move its splats along their ramps as ever, and so the tint's shading follows them.
+  - It gives no light: a `SplatLamp` is a node of its own, and one put under a tinted instance lights the picture like any other.
+  - It hides what is behind it on the pixels it takes, and a thing in front hides it. A floor shadow that falls on it darkens it like anything else, and it stays outside the palette.
+- **At its edge an art pixel can hold one tinted sample of four.** That sample goes through the pixel look with the other three, as a line's does, so a pixel there can take another palette colour: in the picture below, 2,341 pixels are a tint's and 42 more changed to a colour that is not.
+- **While an instance is tinted, every splat is drawn twice.** The draw pass draws a tinted instance's splats in the tint, with depth, on its pixels only. The pixel look then has to know which samples those are, so the same quads are drawn once more into a target of their own, white for a tinted instance's and black for the others' (`shaders/splat_tint.gdshader`). That target is made the first time an instance is tinted and is not drawn while none is, so a scene without a tint pays nothing. Measured on an RTX 4070 SUPER with 87,032 splats at 320 x 180 and two instances tinted: the passes went from 0.29 to 0.47 ms on the GPU in the Compatibility renderer (as the engine reports them, 2.2 to 3.3 ms in Forward+ and 1.2 to 2.3 ms in Mobile), and the script from 0.035 to 0.039 ms a frame.
+
+`dev/comparisons/tint.png` shows a desk set tinted green on free floor and one tinted red that overlaps another, each with its footprint as marks, and `dev/comparisons/tint-shadows.png` the same frame with floor shadows on; `dev/tools/splat_tint_report.gd` makes and checks both.
+
 ## The debug panel
 
 `debug/splat_debug_panel.gd` (`SplatDebugPanel`) is a small panel for judging the pixel look while the game runs. It finds every `SplatScene` in the tree by itself.
@@ -163,13 +187,14 @@ SplatDebugPanel.add_to(self)    # null, and nothing made, in a release export
 | Pass | Where | What |
 |------|-------|------|
 | Shadow cells, only with floor shadows | `shaders/splat_shadow_cast.gdshader`, in a 3D `SubViewport` of 512 x 512 | The floor's grid from above, one texel a cell. The same quads as the draw pass: each splat is carried down the sun's ray and marks the cell it lands in. |
-| Draw | `shaders/splat_scene_draw.gdshader`, in a 3D `SubViewport` at twice the art size | One quad a splat (a `MultiMesh`). The vertex shader poses each splat by its bone and its instance's transform, moves it by itself if its instance is a particle cloud, and moves its colour along its ramp for the lamps and the dusk. Nothing is sorted: solid splats are cut out at half their Gaussian and written with depth. Then, with floor shadows, one quad (`shaders/splat_shadow.gdshader`) marks the samples that lie in a shadow, depth-tested against the splats. Then, with marks, one quad a line (`shaders/splat_mark_cut.gdshader`) clears the samples a line covers, depth-tested too. |
+| Draw | `shaders/splat_scene_draw.gdshader`, in a 3D `SubViewport` at twice the art size | One quad a splat (a `MultiMesh`). The vertex shader poses each splat by its bone and its instance's transform, moves it by itself if its instance is a particle cloud, and moves its colour along its ramp for the lamps and the dusk. Nothing is sorted: solid splats are cut out at half their Gaussian and written with depth. Then, with floor shadows, one quad (`shaders/splat_shadow.gdshader`) marks the samples that lie in a shadow, depth-tested against the splats. Then, with marks, one quad a line (`shaders/splat_mark_cut.gdshader`) clears the samples a line covers, depth-tested too. A tinted instance's splats are drawn in the tint, on every other art pixel. |
+| Tints, only while an instance is tinted | `shaders/splat_tint.gdshader`, in a 3D `SubViewport` of the samples' size | The splats' quads again, with depth: white where a tinted instance's splat is the nearest thing, black where another is. |
 | Marks' colours, only with marks | `shaders/splat_mark_colour.gdshader`, in a 3D `SubViewport` of the samples' size | The same quads again, with no depth: each line's colour. |
-| Resolve | `shaders/splat_resolve.gdshader`, in a 2D `SubViewport` at the art size | ink-studio's palette and ink look: inside a shape, the palette colour nearest the average of a pixel's four samples (or the one they vote for); on a silhouette, the voted colour inked darker. Samples in a floor shadow are darkened first, so a shadow takes the palette too. A sample that is clear in the samples and drawn in the marks' colours is a line's, and a pixel with two or more of them shows the line's colour as it is. Coverage is binary: alpha is 0 or 1. |
+| Resolve | `shaders/splat_resolve.gdshader`, in a 2D `SubViewport` at the art size | ink-studio's palette and ink look: inside a shape, the palette colour nearest the average of a pixel's four samples (or the one they vote for); on a silhouette, the voted colour inked darker. Samples in a floor shadow are darkened first, so a shadow takes the palette too. A sample that is clear in the samples and drawn in the marks' colours is a line's, and a pixel with two or more of them shows the line's colour as it is; so does one with two or more samples that the tints' target marks. Coverage is binary: alpha is 0 or 1. |
 | Present | `shaders/splat_present.gdshader` | Nearest-neighbour scale-up, alpha clipped. |
 
 - **No compute or geometry shaders.** Splats, instances, bones, light data and marks are float textures read with `texelFetch` in the vertex shader. It runs in Forward+, Mobile and the Compatibility renderer, with the same picture (but for about one pixel in a hundred where a sample sits between two palette colours, and for where some particles are in their loops: see "Particles").
-- **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed (every frame of a fade), and the marks when they differ. The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn; a change of look or of clip, a particle cloud and marks do not rebuild it.
+- **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed (every frame of a fade), and the marks when they differ. The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn; a change of look or of clip, a particle cloud, marks and a tint do not rebuild it.
 - **What particles and marks cost,** measured on an RTX 4070 SUPER in the Compatibility renderer, 76,228 splats at 320 x 180: the script 0.033 ms a frame and the passes 0.25 ms on the GPU; with four clouds (476 splats more) 0.035 ms and 0.26 ms; with 34 lines as well 0.039 ms and 0.27 ms, and 0.04 ms more of the engine's CPU time for the lines' own target. A rebuild of that scene takes 8.5 ms and neither causes one. The GPU figures are of a quiet run: on later runs the same scene with nothing added read anywhere from 0.45 to 1.4 ms, so at this size no GPU cost can be pinned on either.
 
 ## Differences from the Unity renderer
@@ -187,6 +212,11 @@ SplatDebugPanel.add_to(self)    # null, and nothing made, in a release export
 - **A fade is timed by the caller.** The Unity instance started a 0.3 second eased fade itself whenever its clip changed. Here the instance is handed both clips, their times and the weight.
 - **An unknown section at the end of a file stops the read there and keeps what came before** (`SplatClip.unknown_section` names it). The Unity reader refused the file.
 - **Marks are drawn twice.** The Unity renderer drew a line's quad straight into the samples with blending off and an alpha of a half, which its pixel look read as "a mark". Here an alpha of a half is a floor shadow's, and a Godot spatial shader cannot replace a colour and its alpha in one draw. So the lines' quads are drawn once over the samples, to clear what they cover (depth-tested), and once into a target of their own for their colours; a sample clear in the first and drawn in the second is a line's. The picture is the same: a line shows over an empty background too, as in Unity. A line lying in a floor shadow is not darkened, as in Unity (`dev/tools/splat_fx_report.gd` counts the same line pixels with the shadows on).
+- **A tinted instance's samples are told apart in a target of their own.** The Unity renderer wrote a tinted splat's colour with an alpha of a half in its one draw, the same alpha as a mark's, and its pixel look read both alike. Here a half is a floor shadow's, and a spatial shader cannot write a colour and an alpha of its own choosing in one draw. So the tinted splats are drawn as solid ones, and while any instance is tinted every splat is drawn a second time into a target that holds only "tinted" or "not", with depth, where the same splat wins each sample as in the samples. Two cheaper ways do not work:
+  - A line's way, clearing the samples and keeping the colours in a target with no depth, would not do: a tinted splat must hide and be hidden by every other splat.
+  - Marking the tinted samples by another alpha (a quarter, multiplied in by a second draw of only the tinted quads) was built and measured. It was right in Compatibility and Forward+, and cost a third as much (0.06 ms more on the GPU in Compatibility, against 0.18). The Mobile renderer keeps two bits of alpha while it draws, so a quarter came out as the floor shadows' value and the shadows were lost; and in every renderer two tinted splats at exactly one depth marked a sample twice (245 samples of 9,207 in the test scene).
+
+  What else differs: the tint is a colour and a switch (`tint`, `tinted`), where Unity's was one number with 0 for none, so black can be a tint; and a tinted thing's own shadow follows it as it moves, like every shadow here, where in Unity moving a thing that cast one rebuilt the buffers.
 - **A particle's seed is the GPU's.** The formulas are the Unity shader's, number for number, with the seed taken from the splat's number in the scene as there. But the seed is a hash whose last bits depend on how a driver rounds, so the same cloud does not put each particle at the same point of its loop in Unity, in Forward+ and in Compatibility (see "Particles"). A cloud whose instance casts a floor shadow casts it where its splats are, since the shadow pass poses splats as the draw pass does (reasoned, not looked at); in Unity, where the file has them.
 - **The debug panel is asked for.** The Unity one created itself after every scene load when the game's debug tools were on, and was an immediate-mode window. Here a game calls `SplatDebugPanel.add_to`, and the panel is ordinary controls on a `CanvasLayer`. It lists every `SplatScene`; the Unity one also listed the pictures of that project's second renderer, which is not ported.
 - **One renderer.** The Unity project had a second one for a single avatar in a transparent window, which sorted its splats and blended them, and so could draw splats with a density below 1 as soft dabs. This one draws only solid splats. None of the 63 files that project built has a splat below density 1 (every one of 694,606 is solid), and nor has any sample here, so nothing is lost by it; a file that had some would be drawn without them. What does differ is the edge of a solid splat: blended there, cut out here, which the pixel look then resolves the same way.
@@ -218,10 +248,6 @@ Tried on 2026-11-18 with Godot 4.7.2: the demo scene, exported for the web (sing
 - **By pixel, the cursor is asked for once a frame.** With the frame rate capped low to save power, the switch to catching is late by up to one frame (100 ms at 10 frames a second).
 - Not tried: Linux, several monitors, and Windows display scaling other than this machine's.
 
-## Not ported
-
-The tinted ghost: in the Unity renderer an instance could be given a tint, and was then drawn in that colour on every other art pixel, for a thing being placed. Here a thing being placed is drawn as it is, with its footprint as marks.
-
 ## Checking it
 
 ```sh
@@ -250,6 +276,14 @@ godot --path <folder> --rendering-method forward_plus -s res://splats/tools/spla
 ```
 
 It captures 48 frames of the three sample clouds in one scene, a frame with a dotted grid and two outlines, and the window with the panel open in each look. It checks the shader's particles against `SplatParticles`, that neither particles nor marks rebuild anything, that every pixel with marks is covered or clear, that a dotted line is on every other art pixel and that a thing in front hides a line, and that the panel's keys work; and it prints what a frame costs with and without. It passes in Compatibility, Forward+ and Mobile (2026-11-19, Windows, one NVIDIA GPU).
+
+The tint has one, which needs a window and the samples (and a floor in the same way):
+
+```sh
+godot --path <folder> -s res://splats/tools/splat_tint_report.gd -- --tag=compat
+```
+
+It draws the sample desk set with two more, one tinted green on free floor and one tinted red that overlaps the first, each with its footprint as marks. It checks that every sample a tinted splat is nearest at is marked and no other, that the tints' shaded colours are in the picture on every other art pixel only and what is behind on the pixels between, that every pixel is covered or clear with floor shadows and marks as well, that dusk darkens a tint's shading, that a tinted thing darkens the floor only while it casts a shadow and is itself darkened by a shadow that falls on it, and that giving, changing and taking away a tint rebuilds nothing and leaves the picture as it was; and it prints what a frame costs with and without. It passes in Compatibility, Forward+ and Mobile (2026-11-19, Windows, one NVIDIA GPU).
 
 The wardrobe and the clips have one too, which needs a window and nothing but the samples:
 

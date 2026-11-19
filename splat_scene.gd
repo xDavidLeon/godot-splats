@@ -32,7 +32,10 @@
 ## [b]Marks.[/b] [method set_marks] draws lines into the picture on top of what lies under them, in
 ## colours of their own that the pixel look leaves alone: an editor's grid, an outline round a thing.
 ##
-## Not ported from Unity: the tinted ghost.
+## [b]A tint.[/b] An instance with [member SplatInstance.tinted] is drawn in one colour, shaded by how
+## light each of its splats is, on every other art pixel, so what is behind it shows on the pixels
+## between. The pixel look leaves it as it is, as it does a mark. A tint is four numbers in the
+## instance's row: giving, changing or taking one rebuilds nothing.
 # In Unity, the draw is a CommandBuffer with DrawProcedural and StructuredBuffers, and lamps, dusk
 # and shadows were worked out on the CPU at each rebuild. Here SubViewports do it: a 3D one (it has a
 # depth buffer) holding one MultiMesh of quads, a 2D one for the resolve, and, only while floor
@@ -42,7 +45,9 @@
 # Unity drew a mark's quad straight into the samples with an alpha of a half. Here that alpha is the
 # floor shadows', and a spatial shader cannot replace a colour and its alpha in one draw, so the marks
 # are drawn twice: once into the samples to clear what they cover, once into a target of their own
-# for their colours (splat_marks.gdshaderinc).
+# for their colours (splat_marks.gdshaderinc). Unity wrote a tinted instance's splats with that alpha
+# of a half too; here, while an instance is tinted, every splat is drawn a second time into a target
+# of its own that says which samples are a tinted instance's (splat_tint.gdshader).
 class_name SplatScene
 extends Node
 
@@ -54,6 +59,7 @@ const SHADOW_CAST_SHADER: Shader = preload("res://addons/splats/shaders/splat_sh
 const SHADOW_SHADER: Shader = preload("res://addons/splats/shaders/splat_shadow.gdshader")
 const MARK_CUT_SHADER: Shader = preload("res://addons/splats/shaders/splat_mark_cut.gdshader")
 const MARK_COLOUR_SHADER: Shader = preload("res://addons/splats/shaders/splat_mark_colour.gdshader")
+const TINT_SHADER: Shader = preload("res://addons/splats/shaders/splat_tint.gdshader")
 
 ## Colours the pixel look can tell apart in one picture.
 const MAX_PALETTE: int = 128
@@ -72,7 +78,7 @@ const CLOCK_WRAP: float = 3600.0
 const _SPLATS_WIDTH: int = 1024       # texels in a row: 256 splats
 const _BONES_WIDTH: int = 768         # texels in a row: 256 bones
 const _LIGHTS_WIDTH: int = 1024       # texels in a row: 1024 splats' normals and ramps, or 4096 splats' brightness
-const _INSTANCE_FLOATS: int = 20
+const _INSTANCE_FLOATS: int = 24
 const _MARK_FLOATS: int = 16
 const _MARK_DEPTH_BIAS: float = 0.1   # metres nearer the camera the marks are depth-tested
 const _SHADOW_HEIGHT: float = 0.004   # metres above the floor the shadow discs lie
@@ -162,6 +168,8 @@ var look_update_count: int = 0
 var mark_count: int = 0
 ## How many times the lines have been handed to the GPU: only when they differ.
 var mark_upload_count: int = 0
+## Instances drawn in a tint this frame ([member SplatInstance.tinted]).
+var tinted_count: int = 0
 ## What the last frame cost this script, in milliseconds (uploads included, the GPU's work not).
 var last_cpu_msec: float = 0.0
 ## What the last rebuild cost, in milliseconds.
@@ -213,6 +221,8 @@ var _marks_viewport: SubViewport
 var _mark_cut_material: ShaderMaterial
 var _mark_colour_material: ShaderMaterial
 var _mark_cut: MultiMeshInstance3D
+var _tints_viewport: SubViewport
+var _tint_material: ShaderMaterial
 # endregion
 
 
@@ -243,6 +253,13 @@ func get_samples() -> ViewportTexture:
 ## gives, and a row is a step along z. For debugging.
 func get_shadow_cells() -> ViewportTexture:
 	return _shadow_viewport.get_texture() if _shadow_viewport != null else null
+
+
+## Which samples are a tinted instance's: the samples' size, white where one of its splats is the
+## nearest thing, black where another splat is; [code]null[/code] until an instance has been tinted.
+## For debugging.
+func get_tints() -> ViewportTexture:
+	return _tints_viewport.get_texture() if _tints_viewport != null else null
 
 
 ## The floor cell (x, z) at the first texel of [method get_shadow_cells] this frame. Cell (x, z) spans
@@ -310,6 +327,7 @@ func draw(seconds: float) -> void:
 	var started: int = Time.get_ticks_usec()
 	var looks_changed: bool = false
 	var bones_changed: bool = false
+	var tints: int = 0
 	for i: int in _instances.size():
 		var instance: SplatInstance = _instances[i]
 		if _worn[i] != instance.look_version:
@@ -339,6 +357,12 @@ func draw(seconds: float) -> void:
 		_instance_data[o + 17] = instance.motion_reach
 		_instance_data[o + 18] = instance.motion_wobble
 		_instance_data[o + 19] = instance.motion_speed
+		_instance_data[o + 20] = instance.tint.r8 / 255.0
+		_instance_data[o + 21] = instance.tint.g8 / 255.0
+		_instance_data[o + 22] = instance.tint.b8 / 255.0
+		_instance_data[o + 23] = 1.0 if instance.tinted else 0.0
+		if instance.tinted:
+			tints += 1
 		var clip: SplatClip = instance.get_clip()
 		if clip.bone_count == 0:
 			continue
@@ -347,6 +371,7 @@ func draw(seconds: float) -> void:
 			continue
 		_last_stamp[i] = stamp
 		bones_changed = true
+	tinted_count = tints
 	if looks_changed:
 		look_update_count += 1
 		_upload_looks()
@@ -366,18 +391,19 @@ func draw(seconds: float) -> void:
 	_draw_material.set_shader_parameter(&"clock", fmod(seconds, CLOCK_WRAP))
 	_light(lens_vector)
 	_mark(lens_vector)
+	_tint()
 	_resolve_material.set_shader_parameter(&"average_interior", interior == Interior.AVERAGE)
 	_resolve_material.set_shader_parameter(&"dither", dither)
 	last_cpu_msec = (Time.get_ticks_usec() - started) / 1000.0
 
 
-## What the passes (the floor's shadow cells when they are on, draw, the marks' and resolve) cost last frame, in
+## What the passes (the floor's shadow cells when they are on, draw, the marks', the tints' and resolve) cost last frame, in
 ## milliseconds: x on the CPU, y on the GPU. Zero unless [member measure_render_time] is on.
 func get_render_msec() -> Vector2:
 	if not measure_render_time or _samples_viewport == null:
 		return Vector2.ZERO
 	var total: Vector2 = Vector2.ZERO
-	for viewport: SubViewport in [_shadow_viewport, _samples_viewport, _marks_viewport, _picture_viewport]:
+	for viewport: SubViewport in [_shadow_viewport, _samples_viewport, _marks_viewport, _tints_viewport, _picture_viewport]:
 		if viewport == null or viewport.render_target_update_mode == SubViewport.UPDATE_DISABLED:
 			continue
 		total.x += RenderingServer.viewport_get_measured_render_time_cpu(viewport.get_viewport_rid())
@@ -396,8 +422,8 @@ func shown_splat_count() -> int:
 
 ## One line on what the picture holds and costs.
 func status() -> String:
-	return "%d splats (%d shown) in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, %d marks, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
-		splat_count, shown_splat_count(), instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off", mark_count,
+	return "%d splats (%d shown) in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, %d marks, %d tinted, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
+		splat_count, shown_splat_count(), instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off", mark_count, tinted_count,
 		art_size.x, art_size.y, last_cpu_msec, last_rebuild_msec]
 # endregion
 
@@ -629,6 +655,59 @@ static func _quad_mesh() -> ArrayMesh:
 # endregion
 
 
+# region Tint
+# This frame's tinted instances: while there is one, every splat once more into a target that says
+# which samples are theirs. Their colours are the draw pass's work. Nothing when there are none.
+func _tint() -> void:
+	_resolve_material.set_shader_parameter(&"tint_samples", tinted_count > 0)
+	if tinted_count > 0 and _tints_viewport == null:
+		_build_tint_pass()
+	if _tints_viewport == null:
+		return
+	_tints_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if tinted_count > 0 else SubViewport.UPDATE_DISABLED
+	if tinted_count == 0:
+		return
+	for parameter: StringName in [&"splats", &"instances", &"bones", &"looks", &"clock", &"view", &"size", &"lens"]:
+		_tint_material.set_shader_parameter(parameter, _draw_material.get_shader_parameter(parameter))
+
+
+# The splats' quads once more, in a target of the samples' size with its own depth. Built the first
+# time an instance is tinted.
+func _build_tint_pass() -> void:
+	_tints_viewport = SubViewport.new()
+	_tints_viewport.name = "Tints"
+	_tints_viewport.own_world_3d = true
+	_tints_viewport.transparent_bg = true
+	_tints_viewport.size = art_size * 2
+	_tints_viewport.msaa_3d = Viewport.MSAA_DISABLED
+	_tints_viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	_tints_viewport.use_taa = false
+	_tints_viewport.use_debanding = false
+	_tints_viewport.positional_shadow_atlas_size = 0
+	add_child(_tints_viewport)
+	move_child(_tints_viewport, _picture_viewport.get_index()) # before the picture, which reads it
+
+	var eye: Camera3D = Camera3D.new()
+	eye.environment = Environment.new()
+	_tints_viewport.add_child(eye)
+	eye.make_current()
+
+	_tint_material = ShaderMaterial.new()
+	_tint_material.shader = TINT_SHADER
+	_tint_material.set_shader_parameter(&"splats_width", _SPLATS_WIDTH)
+	_tint_material.set_shader_parameter(&"bones_width", _BONES_WIDTH)
+	var quads: MultiMeshInstance3D = MultiMeshInstance3D.new()
+	quads.multimesh = _multimesh
+	quads.material_override = _tint_material
+	quads.custom_aabb = AABB(Vector3.ONE * -100000.0, Vector3.ONE * 200000.0)
+	quads.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	quads.ignore_occlusion_culling = true
+	_tints_viewport.add_child(quads)
+	_resolve_material.set_shader_parameter(&"tints", _tints_viewport.get_texture())
+	RenderingServer.viewport_set_measure_render_time(_tints_viewport.get_viewport_rid(), measure_render_time)
+# endregion
+
+
 # region Building
 func _build_passes() -> void:
 	# Pass 1: one quad a splat, with depth, at twice the art resolution.
@@ -700,6 +779,8 @@ func _apply_measuring() -> void:
 		RenderingServer.viewport_set_measure_render_time(_shadow_viewport.get_viewport_rid(), measure_render_time)
 	if _marks_viewport != null:
 		RenderingServer.viewport_set_measure_render_time(_marks_viewport.get_viewport_rid(), measure_render_time)
+	if _tints_viewport != null:
+		RenderingServer.viewport_set_measure_render_time(_tints_viewport.get_viewport_rid(), measure_render_time)
 
 
 # Gathers the instances and lays their splats end to end. Each splat's last float carries its instance.
@@ -712,6 +793,8 @@ func _rebuild() -> void:
 	_picture_viewport.size = art_size
 	if _marks_viewport != null:
 		_marks_viewport.size = art_size * 2
+	if _tints_viewport != null:
+		_tints_viewport.size = art_size * 2
 	_resolve_rect.position = Vector2.ZERO
 	_resolve_rect.size = Vector2(art_size)
 

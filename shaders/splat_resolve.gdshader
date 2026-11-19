@@ -15,6 +15,10 @@
 // line's. An art pixel with two or more such samples shows their colour as it is, outside the palette
 // and never inked. (The Unity shader knew a mark's sample by an alpha of 0.5, which is the floor
 // shadows' here.)
+// A tinted instance: a covered sample that splat_tint.gdshader drew white is one of its splats', and
+// is read like a line's sample: an art pixel with two or more of them shows their colour as it is.
+// The instance was drawn on every other art pixel only, so the pixels between show what is behind
+// it. A floor shadow darkens a tinted sample like any other, as in the Unity renderer.
 // Drawn on a rectangle that fills a viewport of the art's size.
 shader_type canvas_item;
 render_mode unshaded, blend_disabled;
@@ -27,11 +31,13 @@ uniform float dither = 0.021;          // only with average_interior: ordered no
 uniform float shadow_light = 0.8;      // how much light a floor shadow leaves
 uniform sampler2D marks : filter_nearest, repeat_disable;   // the lines' colours, the samples' size: alpha 1 where a line is
 uniform bool mark_samples = false;     // whether any line is drawn
+uniform sampler2D tints : filter_nearest, repeat_disable;   // the samples' size: white where a tinted instance's splat is the nearest thing
+uniform bool tint_samples = false;     // whether any instance is tinted
 
 const float BAYER[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
 
 const float COVERED_ABOVE = 0.02;
-const float MARK = 2.0; // the alpha sample_at gives a line's sample
+const float MARK = 2.0; // the alpha sample_at gives a line's sample, and a tinted instance's
 const vec3 WEIGHTS = vec3(0.30, 0.55, 0.15);
 
 int nearest(vec3 c, bool solid) {
@@ -58,7 +64,8 @@ ivec2 clamped(ivec2 p) {
 	return clamp(p, ivec2(0), textureSize(samples, 0) - 1);
 }
 
-// A sample: its colour, and its coverage in alpha (a half in a floor shadow, MARK for a line's).
+// A sample: its colour, darkened if it lies in a floor shadow, and its coverage in alpha (a half in a
+// floor shadow, MARK for a line's or a tinted instance's).
 vec4 sample_at(ivec2 at) {
 	vec4 s = texelFetch(samples, at, 0);
 	if (mark_samples && s.a <= COVERED_ABOVE) {
@@ -66,6 +73,14 @@ vec4 sample_at(ivec2 at) {
 		if (line.a > 0.5) {
 			return vec4(line.rgb, MARK);
 		}
+	}
+	if (s.a > 0.25 && s.a < 0.75) {
+		// in a floor shadow: a share of its light, rounded as an 8-bit target rounds it (the Unity
+		// renderer darkened the samples in one)
+		s.rgb = floor(s.rgb * shadow_light * 255.0 + 0.5) / 255.0;
+	}
+	if (tint_samples && s.a > COVERED_ABOVE && texelFetch(tints, at, 0).r > 0.5) {
+		return vec4(s.rgb, MARK);
 	}
 	return s;
 }
@@ -95,11 +110,6 @@ void fragment() {
 			line += s.rgb;
 			lines++;
 		}
-		if (s.a > 0.25 && s.a < 0.75) {
-			// in a floor shadow: a share of its light, rounded as an 8-bit target rounds it (the Unity
-			// renderer darkened the samples in one)
-			s.rgb = floor(s.rgb * shadow_light * 255.0 + 0.5) / 255.0;
-		}
 		solid[i] = s.a > COVERED_ABOVE;
 		labels[i] = nearest(s.rgb, solid[i]);
 		native += s.rgb * 0.25;
@@ -110,7 +120,7 @@ void fragment() {
 	if (coverage <= 0.0) {
 		COLOR = vec4(0.0);
 	} else if (lines >= 2) {
-		COLOR = vec4(line / float(lines), 1.0); // a line: outside the palette, never inked
+		COLOR = vec4(line / float(lines), 1.0); // a line or a tint: outside the palette, never inked
 	} else {
 		// the colour most covered samples vote for. With the vote look a tie goes to the one nearest the
 		// samples' average (the first one read left specks on fringes at room scale); with the average

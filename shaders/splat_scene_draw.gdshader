@@ -12,11 +12,13 @@
 // The floor shadows are drawn after this, by splat_shadow.gdshader.
 // Particles (an instance's motion) move in splat_pose.gdshaderinc. The lines drawn over the picture
 // (marks) are splat_mark_cut.gdshader and splat_mark_colour.gdshader.
-// Not ported: the tinted ghost.
+// A tinted instance is drawn in its tint, shaded by how light each splat was so its shape still
+// reads, and only on every other art pixel, so what is behind it shows on the others.
+// splat_tint.gdshader says which samples those are, and the pixel look leaves them as they are.
 shader_type spatial;
 render_mode unshaded, cull_disabled, skip_vertex_transform, shadows_disabled, fog_disabled;
 
-#include "splat_pose.gdshaderinc"
+#include "splat_project.gdshaderinc"
 
 const int MAX_LAMPS = 16;
 
@@ -31,31 +33,12 @@ uniform vec4 lamps[16];          // xyz: where it is in the world; w: how far it
 uniform float lamp_strengths[16]; // what it adds right next to it, where 1 is a whole ramp
 uniform int lamp_count = 0;
 uniform int dusk = 0;            // ramp steps the day has dimmed
-uniform mat4 view;               // world -> camera view (right-handed, looking down -z)
-uniform vec2 size;               // target width, height in pixels
-uniform vec4 lens;               // x: pixels per metre (orthographic) or focal length in pixels (perspective); y: 1 if orthographic; z: near; w: far
 
-varying vec2 offset; // pixels from the splat's centre
-varying vec3 conic;  // the inverse of its screen covariance
-varying vec3 colour; // sRGB, 0..1
-
-// a view-space point's pixel
-vec2 pixel_of(vec3 v) {
-	float k = lens.y > 0.5 ? lens.x : lens.x / -v.z;
-	return v.xy * k + size * 0.5;
-}
-
-vec4 clip_of(vec2 pixel, vec3 v) {
-	vec2 ndc = pixel / size * 2.0 - 1.0;
-	float depth = clamp((-v.z - lens.z) / (lens.w - lens.z), 0.0, 1.0); // 0 near, 1 far
-	// POSITION is written as it is, and a viewport's clip space has y pointing down in every renderer.
-	// Godot's depth is reversed: the near plane is 1. The far plane is 0, or -1 in the Compatibility renderer.
-#if CURRENT_RENDERER == RENDERER_COMPATIBILITY
-	return vec4(ndc.x, -ndc.y, 1.0 - 2.0 * depth, 1.0);
-#else
-	return vec4(ndc.x, -ndc.y, 1.0 - depth, 1.0);
-#endif
-}
+varying vec2 offset;  // pixels from the splat's centre
+varying vec3 conic;   // the inverse of its screen covariance
+varying vec3 colour;  // sRGB, 0..1
+varying vec2 pixel;   // where in the target, counted from the bottom left
+varying float tinted; // 1 for a splat of a tinted instance
 
 // The splat's packed colour once the lamps and the dusk have moved it along its ramp.
 float relit(int splat, vec3 at, mat3 carry, float first_ramp, float baked) {
@@ -100,6 +83,8 @@ void vertex() {
 	offset = vec2(0.0);
 	conic = vec3(0.0);
 	colour = vec3(0.0);
+	pixel = vec2(0.0);
+	tinted = 0.0;
 
 	vec3 at;
 	mat3 cov;
@@ -107,42 +92,32 @@ void vertex() {
 	float pk;
 	vec4 of_instance;
 	if (pose_splat(INSTANCE_ID, at, cov, carry, pk, of_instance)) {
-		vec3 v = (view * vec4(at, 1.0)).xyz;
-		mat3 r = transpose(mat3(view)); // r[0], r[1], r[2]: the rows of the view's rotation
-		vec3 a;
-		vec3 c;
-		if (lens.y > 0.5) {
-			a = lens.x * r[0];
-			c = lens.x * r[1];
-		} else {
-			float iz = -1.0 / v.z;
-			a = lens.x * iz * r[0] + lens.x * v.x * iz * iz * r[2];
-			c = lens.x * iz * r[1] + lens.x * v.y * iz * iz * r[2];
-		}
-		float A = dot(a, cov * a) + 0.15;
-		float B = dot(c, cov * a);
-		float C = dot(c, cov * c) + 0.15;
-		float det = A * C - B * B;
-		if (-v.z >= lens.z && det > 0.0) {
-			conic = vec3(C / det, -B / det, A / det);
-			// The cut-out keeps exp(power) >= 0.5, which ends 1.18 standard deviations out; the quad need go no
-			// further (ink-studio's blended dabs reach 3). A pixel is added for the edge.
-			vec2 extent = vec2(min(1.2 * sqrt(A) + 1.0, 2048.0), min(1.2 * sqrt(C) + 1.0, 2048.0));
-			offset = VERTEX.xy * extent; // the quad's corners are at -1 and 1
-			// a thin thing lying on a surface is tested a little nearer than it is (the instance's depth bias)
-			POSITION = clip_of(pixel_of(v) + offset, vec3(v.xy, v.z + of_instance.z));
+		vec4 position;
+		vec2 from_centre;
+		vec3 inverse;
+		vec2 at_pixel;
+		if (project_splat(at, cov, of_instance.z, VERTEX.xy, position, from_centre, inverse, at_pixel)) { // the quad's corners are at -1 and 1
+			POSITION = position;
+			offset = from_centre;
+			conic = inverse;
+			pixel = at_pixel;
 			if (lamp_count > 0 || dusk > 0) {
 				pk = relit(INSTANCE_ID, at, carry, of_instance.y, pk);
 			}
 			colour = min(vec3(mod(pk, 256.0), mod(floor(pk / 256.0), 256.0), floor(pk / 65536.0)) / 255.0, vec3(1.0));
+			vec4 tint = splat_tint(INSTANCE_ID);
+			if (tint.w > 0.5) {
+				// the tint, shaded by how light the splat is, so the thing's shape still reads
+				// (SplatInstance.tint_shade is the same rule in script)
+				colour = clamp(tint.rgb * (0.55 + 0.7 * dot(colour, vec3(0.30, 0.55, 0.15))), 0.0, 1.0);
+				tinted = 1.0;
+			}
 		}
 	}
 }
 
 void fragment() {
-	vec2 d = offset;
-	float power = -0.5 * (conic.x * d.x * d.x + conic.z * d.y * d.y) - conic.y * d.x * d.y;
-	if (power + 0.693147 < 0.0) { // exp(power) >= 0.5: the middle of ink-studio's hard edge
+	if (outside_splat(offset, conic) || (tinted > 0.5 && tint_skipped(pixel))) {
 		discard;
 	}
 	// The picture holds the palette's own sRGB values. Forward+ and Mobile encode what a shader writes

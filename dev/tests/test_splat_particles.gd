@@ -210,7 +210,7 @@ func _test_scene() -> void:
 	assert_eq(scene.rebuild_count, 1, "the first draw builds the splats")
 	assert_eq(scene.splat_count, 929 + 38 + 130, "the mug and both clouds are in the picture")
 	var image: Image = scene._instance_texture.get_image()
-	assert_eq([image.get_width(), image.get_height()], [5, 3], "an instance's row is five texels")
+	assert_eq([image.get_width(), image.get_height()], [6, 3], "an instance's row is six texels")
 	# the fifth texel as the shader reads it: (motion, reach, wobble, speed). A headless run keeps no
 	# texture that was updated, so the rows are read from what the scene uploads.
 	assert_eq(_texel(scene, 4, 0), Color(0.0, 0.0, 0.0, 1.0), "the mug's says no motion")
@@ -239,7 +239,7 @@ func _test_scene() -> void:
 
 # Texel x of instance y's row, as the scene lays the instances out for upload.
 func _texel(scene: SplatScene, x: int, y: int) -> Color:
-	var o: int = (y * 5 + x) * 4
+	var o: int = (y * 6 + x) * 4
 	return Color(scene._instance_data[o], scene._instance_data[o + 1], scene._instance_data[o + 2], scene._instance_data[o + 3])
 
 

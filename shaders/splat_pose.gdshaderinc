@@ -8,10 +8,11 @@
 // (its piece + 1), so 0 there is a splat of no piece. And where its colour is one of a colour region's,
 // the packed colour is -(1 + that colour's palette index).
 uniform sampler2D splats : filter_nearest, repeat_disable;
-// 20 floats an instance in 5 texels, one instance a row: its 3x4 object-to-world by rows, then
+// 24 floats an instance in 6 texels, one instance a row: its 3x4 object-to-world by rows, then
 //   (first bone, first ramp, depth bias in metres, 1 if it casts a floor shadow)
 //   (its motion: 0 none, 1 rise, 2 drift; how high a rise goes or how far a drift, in metres; how wide
 //    a rise wobbles; its speed)
+//   (its tint, sRGB 0..1; 1 if it is tinted)
 uniform sampler2D instances : filter_nearest, repeat_disable;
 // 12 floats a bone in 3 texels: every instance's bones for this frame, end to end
 uniform sampler2D bones : filter_nearest, repeat_disable;
@@ -40,6 +41,11 @@ void bone(int index, out mat3 m, out vec3 t) {
 	vec4 c = texelFetch(bones, at + ivec2(2, 0), 0);
 	m = by_rows(a.xyz, vec3(a.w, b.xy), vec3(b.zw, c.x));
 	t = c.yzw;
+}
+
+// The tint of a splat's instance: xyz the colour, w 1 if it has one.
+vec4 splat_tint(int splat) {
+	return texelFetch(instances, ivec2(5, int(splat_texel(splat, 3).w) % 4096), 0);
 }
 
 // three numbers in 0..1 from one, the same every frame: a particle's own seed

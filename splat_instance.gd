@@ -14,9 +14,13 @@
 ## [b]Particles.[/b] With a [member motion] the asset is a cloud: steam, flames, dust. Each of its
 ## splats moves by itself in the shader, on the scene's clock. A cloud's file is an ordinary prop:
 ## where the particles start and what colour they are. Turn [member casts_shadow] off for one.
+##
+## [b]A tint.[/b] With [member tinted] it is drawn in one colour, [member tint], shaded by how light
+## each of its splats is, on every other art pixel, so what is behind it shows through.
 # In Unity, this is the SplatInstance MonoBehaviour with a TextAsset; Godot has no TextAsset, so the
 # asset is a path to the .bytes file, read once and shared. Unity's instance made a new clip of the
-# shown splats for every look and timed its own fades (0.3 s, eased).
+# shown splats for every look and timed its own fades (0.3 s, eased). Unity's tint was one number,
+# 0xRRGGBB with 0 for none, so it had no black.
 class_name SplatInstance
 extends Node3D
 
@@ -83,6 +87,21 @@ static var _clips: Dictionary[String, SplatClip] = {}
 ## How fast the cloud's clock runs against the scene's.
 @export var motion_speed: float = 1.0
 
+@export_group("Tint")
+## Whether it is drawn in [member tint] instead of its own colours, and only on every other art
+## pixel, so what is behind it shows on the pixels between: a thing that is not there yet, or not
+## quite. The pixel look leaves a tinted pixel as it is, outside the palette and never inked, and
+## every pixel of the picture is still covered or clear. It costs the CPU nothing, may change every
+## frame, and never rebuilds the scene.
+## [br]Nothing else about the instance changes: it hides what is behind it on the pixels it takes,
+## lamps and dusk still move its splats along their ramps (and so the tint's shading), and it darkens
+## the floor while [member casts_shadow] is on.
+@export var tinted: bool = false
+
+## The colour a tinted instance is drawn in, sRGB. Each splat takes it at 0.55 to 1.25 of its
+## strength, by how light the splat's own colour is ([method tint_shade]), so the shape still reads.
+@export_color_no_alpha var tint: Color = Color.WHITE
+
 @export_group("")
 ## The time [member clip_name] is shown at, in seconds of that clip's own. Negative: the scene's
 ## clock plus [member time_offset].
@@ -147,6 +166,15 @@ static func load_shared(path: String) -> SplatClip:
 		push_error("[SplatInstance] %s" % SplatClip.last_error)
 	_clips[path] = clip
 	return clip
+# endregion
+
+
+# region Tint
+## The colour a splat whose own colour is [param own] is drawn in on an instance tinted
+## [param with_tint]: the rule the shader runs. Both are sRGB.
+static func tint_shade(with_tint: Color, own: Color) -> Color:
+	var light: float = 0.55 + 0.7 * (0.30 * own.r + 0.55 * own.g + 0.15 * own.b)
+	return Color(clampf(with_tint.r * light, 0.0, 1.0), clampf(with_tint.g * light, 0.0, 1.0), clampf(with_tint.b * light, 0.0, 1.0))
 # endregion
 
 

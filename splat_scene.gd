@@ -9,6 +9,12 @@
 ## quarter turn). Then [code]splat_resolve.gdshader[/code] makes the pixel look at the art resolution.
 ## Show [method get_picture] with nearest-neighbour filtering ([code]splat_present.gdshader[/code]).
 ##
+## An instance that wears a look ([method SplatInstance.wear]) has every splat of its wardrobe in the
+## big texture; a small texture says, for each instance, which pieces show and what its palette is,
+## and the shader asks it. So a change of look writes that instance's row and its ramps and rebuilds
+## nothing. A change of clip, and a fade from one to another ([method SplatInstance.cross_fade]), are
+## that instance's bones for the frame, mixed on the CPU.
+##
 ## Light, all of it off until asked for, so a scene that sets none of this draws its assets' bakes:
 ## [br]- [b]Lamps:[/b] every [SplatLamp] under [member instances_root] lifts the splats near it and
 ## facing it along the ramp each was shaded on.
@@ -19,12 +25,13 @@
 ## furniture that moves, the dusk falling and a clip playing cost the CPU nothing and rebuild nothing.
 ## Only files with light data are lit again ([method SplatClip.has_light]); the others keep their colours.
 ##
-## Not ported from Unity: the wardrobe, clip cross-fades, particles and the editing overlays.
+## Not ported from Unity: particles and the editing overlays.
 # In Unity, the draw is a CommandBuffer with DrawProcedural and StructuredBuffers, and lamps, dusk
 # and shadows were worked out on the CPU at each rebuild. Here SubViewports do it: a 3D one (it has a
 # depth buffer) holding one MultiMesh of quads, a 2D one for the resolve, and, only while floor
 # shadows are on, a small 3D one for the floor's grid. None needs compute shaders, so the
-# Compatibility renderer can run it.
+# Compatibility renderer can run it. Unity's instance made a new clip holding only the shown splats for
+# every look, and the scene rebuilt its buffers; here the pieces not worn are skipped by the shader.
 class_name SplatScene
 extends Node
 
@@ -39,6 +46,8 @@ const SHADOW_SHADER: Shader = preload("res://addons/splats/shaders/splat_shadow.
 const MAX_PALETTE: int = 128
 ## Lamps that light one picture. More are left out, with a warning.
 const MAX_LAMPS: int = 16
+## Instances in one picture. A splat carries its instance and its wardrobe piece in one float.
+const MAX_INSTANCES: int = 4096
 ## Floor shadows fall within this many cells of where the camera looks, each way: 12.8 m with the
 ## default [member shadow_cell].
 const SHADOW_REACH_CELLS: int = 256
@@ -124,6 +133,8 @@ var palette_count: int = 0
 var lamp_count: int = 0
 ## How many times the big texture has been rebuilt.
 var rebuild_count: int = 0
+## How many times an instance's look has been written again without a rebuild.
+var look_update_count: int = 0
 ## What the last frame cost this script, in milliseconds (uploads included, the GPU's work not).
 var last_cpu_msec: float = 0.0
 ## What the last rebuild cost, in milliseconds.
@@ -131,7 +142,8 @@ var last_rebuild_msec: float = 0.0
 
 var _instances: Array[SplatInstance] = []
 var _first_bone: PackedInt32Array = PackedInt32Array()
-var _last_frame: PackedInt32Array = PackedInt32Array()
+var _last_stamp: PackedInt64Array = PackedInt64Array()
+var _worn: PackedInt32Array = PackedInt32Array()
 var _turns: PackedInt32Array = PackedInt32Array()
 var _first_ramp: PackedInt32Array = PackedInt32Array()
 var _built_version: int = -1
@@ -148,6 +160,13 @@ var _instance_texture: ImageTexture
 var _bone_data: PackedFloat32Array = PackedFloat32Array()
 var _bone_texture: ImageTexture
 var _bone_rows: int = 1
+var _look_data: PackedFloat32Array = PackedFloat32Array()
+var _look_texture: ImageTexture
+var _look_width: int = 1
+var _ramp_data: PackedFloat32Array = PackedFloat32Array()
+var _ramp_texture: ImageTexture
+var _ramp_width: int = 1
+var _ramp_rows: int = 1
 var _lamps: Array[SplatLamp] = []
 var _built_lamp_version: int = -1
 var _lamp_root: Node = null
@@ -218,9 +237,14 @@ func draw(seconds: float) -> void:
 		_rebuild()
 
 	var started: int = Time.get_ticks_usec()
+	var looks_changed: bool = false
 	var bones_changed: bool = false
 	for i: int in _instances.size():
 		var instance: SplatInstance = _instances[i]
+		if _worn[i] != instance.look_version:
+			_worn[i] = instance.look_version
+			_write_look(i)
+			looks_changed = true
 		var to_world: Transform3D = instance.global_transform
 		var o: int = i * _INSTANCE_FLOATS
 		# the 3x4 by rows: Godot's basis holds columns
@@ -243,15 +267,14 @@ func draw(seconds: float) -> void:
 		var clip: SplatClip = instance.get_clip()
 		if clip.bone_count == 0:
 			continue
-		var frame: int = instance.frame_at(seconds)
-		if frame == _last_frame[i]:
+		var stamp: int = instance.write_bones(seconds, _bone_data, _first_bone[i] * SplatClip.BONE_STRIDE, _last_stamp[i])
+		if stamp == _last_stamp[i] and stamp >= 0:
 			continue
-		_last_frame[i] = frame
-		var from: int = frame * clip.bone_count * SplatClip.BONE_STRIDE
-		var to: int = _first_bone[i] * SplatClip.BONE_STRIDE
-		for f: int in clip.bone_count * SplatClip.BONE_STRIDE:
-			_bone_data[to + f] = clip.bones[from + f]
+		_last_stamp[i] = stamp
 		bones_changed = true
+	if looks_changed:
+		look_update_count += 1
+		_upload_looks()
 	if not _instances.is_empty():
 		_instance_texture.update(Image.create_from_data(4, _instances.size(), false, Image.FORMAT_RGBAF, _instance_data.to_byte_array()))
 	if bones_changed:
@@ -285,10 +308,19 @@ func get_render_msec() -> Vector2:
 	return total
 
 
+## How many splats the picture's instances show: [member splat_count] less the wardrobe pieces not worn.
+func shown_splat_count() -> int:
+	var shown: int = 0
+	for instance: SplatInstance in _instances:
+		if is_instance_valid(instance):
+			shown += instance.shown_splat_count()
+	return shown
+
+
 ## One line on what the picture holds and costs.
 func status() -> String:
-	return "%d splats in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
-		splat_count, instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off",
+	return "%d splats (%d shown) in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
+		splat_count, shown_splat_count(), instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off",
 		art_size.x, art_size.y, last_cpu_msec, last_rebuild_msec]
 # endregion
 
@@ -333,6 +365,7 @@ func _light(lens_vector: Vector4) -> void:
 	_shadow_cast_material.set_shader_parameter(&"splats", _draw_material.get_shader_parameter(&"splats"))
 	_shadow_cast_material.set_shader_parameter(&"instances", _instance_texture)
 	_shadow_cast_material.set_shader_parameter(&"bones", _bone_texture)
+	_shadow_cast_material.set_shader_parameter(&"looks", _look_texture)
 	_shadow_cast_material.set_shader_parameter(&"slope", Vector2(sun.x, sun.z) / sun.y)
 	_shadow_cast_material.set_shader_parameter(&"grid", Vector4(shadow_cell, floor_height, SplatLight.SHADOW_MIN_HEIGHT, across))
 	_shadow_cast_material.set_shader_parameter(&"first_cell", first_cell)
@@ -504,7 +537,10 @@ func _rebuild() -> void:
 	_gather(instances_root if instances_root != null else get_parent())
 	instance_count = _instances.size()
 	_first_bone.resize(instance_count)
-	_last_frame.resize(instance_count)
+	_last_stamp.resize(instance_count)
+	_worn.resize(instance_count)
+	if instance_count > MAX_INSTANCES:
+		push_warning("[SplatScene] %d instances; one picture holds %d." % [instance_count, MAX_INSTANCES])
 	_turns.resize(instance_count)
 	_first_ramp.resize(instance_count)
 
@@ -517,31 +553,43 @@ func _rebuild() -> void:
 	var ramp_palettes: Array[PackedInt32Array] = []
 	var first_ramp_of: Dictionary[SplatClip, int] = {}
 	var longest_ramp: int = 1
+	_look_width = 1
 
 	var data: PackedFloat32Array = PackedFloat32Array()
-	var palette: PackedInt32Array = PackedInt32Array()
 	var splats: int = 0
 	var bone_total: int = 0
 	for n: int in instance_count:
 		var instance: SplatInstance = _instances[n]
 		var clip: SplatClip = instance.get_clip()
 		_first_bone[n] = bone_total
-		_last_frame[n] = -1
+		_last_stamp[n] = -1
+		_worn[n] = instance.look_version
 		_turns[n] = _turn_of(instance)
-		data.append_array(clip.splats)
+		var wardrobe: bool = clip.has_look()
+		# a wardrobe's splats say which piece they are, and name a region's colour by its palette index
+		data.append_array(clip.look_splats() if wardrobe else clip.splats)
 		var colours: PackedFloat32Array = clip.colour_sets[_turns[n]] if clip.is_prop() else PackedFloat32Array()
 		for i: int in clip.splat_count:
 			var o: int = (splats + i) * SplatClip.STRIDE
 			if not colours.is_empty():
 				data[o + 7] = colours[i]
-			data[o + 15] = n
-		if not first_ramp_of.has(clip):
-			first_ramp_of[clip] = ramp_rows.size()
+			data[o + 15] = n + MAX_INSTANCES * (clip.piece_of[i] + 1) if wardrobe else n
+		if wardrobe:
+			# its ramps are its own rows: they hold the colours it wears
+			_look_width = maxi(_look_width, maxi(clip.pieces.size(), clip.palette.size()))
+			_first_ramp[n] = ramp_rows.size()
 			for ramp: PackedInt32Array in clip.ramps:
 				ramp_rows.append(ramp)
-				ramp_palettes.append(clip.palette)
+				ramp_palettes.append(instance.look_palette())
 				longest_ramp = maxi(longest_ramp, ramp.size())
-		_first_ramp[n] = first_ramp_of[clip]
+		else:
+			if not first_ramp_of.has(clip):
+				first_ramp_of[clip] = ramp_rows.size()
+				for ramp: PackedInt32Array in clip.ramps:
+					ramp_rows.append(ramp)
+					ramp_palettes.append(clip.palette)
+					longest_ramp = maxi(longest_ramp, ramp.size())
+			_first_ramp[n] = first_ramp_of[clip]
 		lights.append_array(clip.light_texels())
 		if clip.has_light():
 			brights.append_array(clip.brightness[mini(_turns[n], clip.brightness.size() - 1)])
@@ -549,10 +597,6 @@ func _rebuild() -> void:
 			brights.resize(brights.size() + clip.splat_count) # never read: these splats have no ramp
 		splats += clip.splat_count
 		bone_total += clip.bone_count
-		# one palette for the picture: the first asset's background, then every colour once
-		for c: int in range(0 if palette.is_empty() else 1, clip.palette.size()):
-			if not palette.has(clip.palette[c]):
-				palette.append(clip.palette[c])
 	splat_count = splats
 
 	var splats_in_a_row: int = _SPLATS_WIDTH / 4
@@ -569,17 +613,25 @@ func _rebuild() -> void:
 	brights.resize(bright_rows * _LIGHTS_WIDTH * 4)
 	_draw_material.set_shader_parameter(&"brightness", ImageTexture.create_from_image(
 			Image.create_from_data(_LIGHTS_WIDTH, bright_rows, false, Image.FORMAT_RGBAF, brights.to_byte_array())))
-	var ramp_data: PackedFloat32Array = PackedFloat32Array()
-	ramp_data.resize(maxi(1, ramp_rows.size()) * longest_ramp * 4)
-	ramp_data.fill(0.0)
+	_ramp_width = longest_ramp
+	_ramp_rows = maxi(1, ramp_rows.size())
+	_ramp_data.resize(_ramp_rows * _ramp_width * 4)
+	_ramp_data.fill(0.0)
 	for r: int in ramp_rows.size():
-		var ramp: PackedInt32Array = ramp_rows[r]
-		for c: int in ramp.size():
-			var o: int = (r * longest_ramp + c) * 4
-			ramp_data[o] = SplatClip.pack(ramp_palettes[r][ramp[c]])
-			ramp_data[o + 1] = ramp.size()
-	_draw_material.set_shader_parameter(&"ramps", ImageTexture.create_from_image(
-			Image.create_from_data(longest_ramp, maxi(1, ramp_rows.size()), false, Image.FORMAT_RGBAF, ramp_data.to_byte_array())))
+		_write_ramp(r, ramp_rows[r], ramp_palettes[r])
+	_ramp_texture = ImageTexture.create_from_image(
+			Image.create_from_data(_ramp_width, _ramp_rows, false, Image.FORMAT_RGBAF, _ramp_data.to_byte_array()))
+	_draw_material.set_shader_parameter(&"ramps", _ramp_texture)
+
+	# What each instance wears, one instance a row: a texel's first float says whether the piece of that
+	# number shows, its second is the palette colour of that number.
+	_look_data.resize(maxi(1, instance_count) * _look_width * 4)
+	_look_data.fill(0.0)
+	for n: int in instance_count:
+		_write_look(n, false)
+	_look_texture = ImageTexture.create_from_image(
+			Image.create_from_data(_look_width, maxi(1, instance_count), false, Image.FORMAT_RGBAF, _look_data.to_byte_array()))
+	_draw_material.set_shader_parameter(&"looks", _look_texture)
 
 	_instance_data.resize(maxi(1, instance_count) * _INSTANCE_FLOATS)
 	_instance_data.fill(0.0)
@@ -601,6 +653,25 @@ func _rebuild() -> void:
 		transforms.resize(splats * 12)
 		_multimesh.buffer = transforms
 
+	_set_palette()
+	last_rebuild_msec = (Time.get_ticks_usec() - started) / 1000.0
+
+
+# One palette for the picture: the first asset's background, then every colour once, each instance's
+# as it wears it.
+func _set_palette() -> void:
+	var palette: PackedInt32Array = PackedInt32Array()
+	var seen: Dictionary[int, bool] = {}
+	var last: PackedInt32Array = PackedInt32Array()
+	for instance: SplatInstance in _instances:
+		var colours: PackedInt32Array = instance.look_palette()
+		if colours == last:
+			continue # the same asset in the same colours again
+		last = colours
+		for c: int in range(0 if palette.is_empty() else 1, colours.size()):
+			if not seen.has(colours[c]):
+				seen[colours[c]] = true
+				palette.append(colours[c])
 	if palette.size() > MAX_PALETTE:
 		push_warning("[SplatScene] %d colours in the picture; the pixel look reads the first %d." % [palette.size(), MAX_PALETTE])
 	palette_count = mini(MAX_PALETTE, palette.size())
@@ -610,7 +681,39 @@ func _rebuild() -> void:
 		colour_vectors[i] = Vector3(((palette[i] >> 16) & 255) / 255.0, ((palette[i] >> 8) & 255) / 255.0, (palette[i] & 255) / 255.0)
 	_resolve_material.set_shader_parameter(&"pal", colour_vectors)
 	_resolve_material.set_shader_parameter(&"pal_count", maxi(1, palette_count))
-	last_rebuild_msec = (Time.get_ticks_usec() - started) / 1000.0
+
+
+# One ramp's row: (packed colour, the ramp's length, 0, 0) for each of its colours, dark to light.
+func _write_ramp(row: int, ramp: PackedInt32Array, palette: PackedInt32Array) -> void:
+	for c: int in ramp.size():
+		var o: int = (row * _ramp_width + c) * 4
+		_ramp_data[o] = SplatClip.pack(palette[ramp[c]])
+		_ramp_data[o + 1] = ramp.size()
+
+
+# What instance n wears, into its row of the look data; with ramps, into its rows of the ramp data too.
+# Nothing for an instance whose asset has no wardrobe.
+func _write_look(n: int, ramps: bool = true) -> void:
+	var instance: SplatInstance = _instances[n]
+	var clip: SplatClip = instance.get_clip()
+	if not clip.has_look():
+		return
+	var palette: PackedInt32Array = instance.look_palette()
+	var row: int = n * _look_width * 4
+	for p: int in clip.pieces.size():
+		_look_data[row + p * 4] = 1.0 if instance.shows(clip.pieces[p]) else 0.0
+	for c: int in palette.size():
+		_look_data[row + c * 4 + 1] = SplatClip.pack(palette[c])
+	if ramps:
+		for r: int in clip.ramps.size():
+			_write_ramp(_first_ramp[n] + r, clip.ramps[r], palette)
+
+
+# After a change of look: the two small textures and the picture's palette. The splats stay as they are.
+func _upload_looks() -> void:
+	_look_texture.update(Image.create_from_data(_look_width, maxi(1, instance_count), false, Image.FORMAT_RGBAF, _look_data.to_byte_array()))
+	_ramp_texture.update(Image.create_from_data(_ramp_width, _ramp_rows, false, Image.FORMAT_RGBAF, _ramp_data.to_byte_array()))
+	_set_palette()
 
 
 func _gather(node: Node) -> void:

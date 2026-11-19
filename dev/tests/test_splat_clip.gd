@@ -12,7 +12,10 @@ func run_tests() -> int:
 	failures = 0
 	_test_prop()
 	_test_lit_clip()
+	_test_wardrobe_file()
+	_test_clips_file()
 	_test_sections()
+	_test_section_refusals()
 	_test_refusals()
 	_test_helpers()
 	return failures
@@ -95,7 +98,124 @@ func _test_lit_clip() -> void:
 	assert_eq(clip.frame_at(3.0), 90, "frame at 3 s")
 	assert_eq(clip.frame_at(8.0), 0, "the clip loops")
 	assert_eq(clip.frame_at(-0.01), 239, "a time before 0 wraps")
+	assert_eq(clip.has_look(), false, "avatar-b has no wardrobe")
+	assert_eq(clip.sections.size(), 0, "avatar-b has no optional section")
+	assert_eq(clip.takes.size(), 1, "a file that names no clips has one")
+	assert_eq(clip.takes[0].name, "clip", "and it is called \"clip\"")
+	assert_eq(clip.takes[0].frame_count, 240, "the one clip is the header's")
+	assert_eq(clip.takes[0].bones == clip.bones, true, "with the header's bones")
+	assert_eq(clip.find("typing") == null, true, "no clip is found by another name")
 	_test_skinning(clip)
+
+
+# A file with a wardrobe (a LOOK section). Every number here was read with the separate script.
+func _test_wardrobe_file() -> void:
+	var clip: SplatClip = SplatClipScript.load_file("res://splats/samples/avatar-a-stand.bytes")
+	if not assert_eq(clip != null, true, "avatar-a-stand.bytes reads (%s)" % SplatClipScript.last_error):
+		return
+	assert_eq(clip.version, 3, "avatar-a-stand is a lit clip")
+	assert_eq(clip.splat_count, 74516, "avatar-a-stand splat count")
+	assert_eq(clip.palette.size(), 31, "avatar-a-stand palette size")
+	assert_eq(clip.bone_count, 8, "avatar-a-stand bones")
+	assert_eq(clip.sections, PackedStringArray(["LOOK", "CLPS"]), "avatar-a-stand has both sections, in the file's order")
+	assert_eq(clip.unknown_section, "", "and nothing unknown after them")
+	assert_eq(clip.has_look(), true, "avatar-a-stand holds a wardrobe")
+	assert_eq(clip.pieces, PackedStringArray(["shoes:shoes", "bottom:trousers", "top:sweater", "top:stripes", "top:cable-knit",
+			"body", "hair:bun", "hair:messy", "under-hat", "accessory:glasses-round", "accessory:headband",
+			"accessory:headphones-round", "accessory:beanie"]), "avatar-a-stand's pieces, in the file's order")
+	assert_eq(clip.piece_of.size(), 74516, "a piece for every splat")
+	assert_eq(clip.piece_of[0], 0, "splat 0 is of piece 0")
+	assert_eq(clip.piece_of[30000], 5, "splat 30000 is of the body")
+	assert_eq(clip.piece_of[74515], 12, "the last splat is of the last piece")
+	var sizes: PackedInt32Array = PackedInt32Array()
+	sizes.resize(clip.pieces.size())
+	var of_none: int = 0
+	for piece: int in clip.piece_of:
+		if piece < 0:
+			of_none += 1
+		else:
+			sizes[piece] += 1
+	assert_eq(sizes, PackedInt32Array([3270, 3879, 5805, 5805, 5805, 20534, 7338, 7745, 2026, 1577, 1591, 2825, 6316]), "splats in each piece")
+	assert_eq(of_none, 0, "every splat is of a piece")
+	assert_eq(clip.regions.keys(), ["skin", "hair", "top", "bottom", "socks", "shoes", "pink"], "the colour regions, in the file's order")
+	assert_eq(clip.regions["skin"], PackedInt32Array([1, 2, 3]), "the skin's palette indices")
+	assert_eq(clip.regions["bottom"], PackedInt32Array([13, 14, 15]), "the bottom's palette indices")
+	assert_eq(clip.regions["pink"], PackedInt32Array([25, 26]), "a region of two colours")
+	assert_eq(clip.palette[clip.regions["top"][1]], 0xd8783e, "the top's middle colour")
+	assert_eq(clip.palette[clip.regions["hair"][0]], 0x521514, "the hair's dark colour")
+	assert_eq(clip.takes.size(), 1, "avatar-a-stand has one clip")
+	assert_eq(clip.takes[0].name, "standing", "named by its CLPS section")
+	assert_eq(clip.takes[0].frame_count, 240, "and it is the header's clip")
+	assert_eq(clip.ramps.size(), 20, "the light data before the sections is intact")
+
+
+# A file with several clips (a CLPS section). Every number here was read with the separate script.
+func _test_clips_file() -> void:
+	var clip: SplatClip = SplatClipScript.load_file("res://splats/samples/avatar-a.bytes")
+	if not assert_eq(clip != null, true, "avatar-a.bytes reads (%s)" % SplatClipScript.last_error):
+		return
+	assert_eq(clip.splat_count, 90636, "avatar-a splat count")
+	assert_eq(clip.palette.size(), 46, "avatar-a palette size")
+	assert_eq(clip.bone_count, 9, "avatar-a bones")
+	assert_eq(clip.sections, PackedStringArray(["LOOK", "CLPS"]), "avatar-a has both sections")
+	assert_eq(clip.pieces.size(), 17, "avatar-a pieces")
+	assert_eq(clip.pieces[16], "device:book", "avatar-a's last piece")
+	assert_eq(clip.piece_of[45000], 5, "avatar-a splat 45000 is of the body")
+	assert_eq(clip.piece_of[90635], 16, "avatar-a's last splat is of the last piece")
+	assert_eq(clip.regions.size(), 7, "avatar-a regions")
+	var names: PackedStringArray = PackedStringArray()
+	for take: SplatClip.Take in clip.takes:
+		names.append(take.name)
+	assert_eq(names, PackedStringArray(["typing", "sitting", "writing", "drawing", "reading", "finished"]), "avatar-a's clips, in the file's order")
+	assert_eq(clip.takes[0].bones == clip.bones, true, "the first clip is the header's")
+	assert_eq(clip.takes[0].reference_frame, -1, "and its references are the file's own")
+	assert_eq(clip.index_of("drawing"), 3, "a clip is found by name")
+	assert_eq(clip.index_of("flying"), -1, "and a name the file does not have is not")
+	# bone 6 at frame 100 of each clip: its first entry, then its translation
+	var expected: Dictionary[String, Array] = {
+		"typing": [0.8795025944709778, -0.3395000696182251, 0.7023429870605469, 0.004233829211443663],
+		"sitting": [0.8740120530128479, 0.07571177184581757, 0.16045615077018738, -0.1131439357995987],
+		"writing": [0.8927561044692993, -0.12071391195058823, 0.37585291266441345, -0.13710543513298035],
+		"drawing": [0.8234009146690369, 0.09876324236392975, 0.18319685757160187, -0.12428367882966995],
+		"reading": [0.7759047746658325, 0.05024242773652077, 0.2693299651145935, -0.15090331435203552],
+		"finished": [0.8061444163322449, 0.11232250183820724, 0.18363380432128906, -0.12487686425447464],
+	}
+	# and where ink-studio posed sample 248 (splat 84699) at each later clip's reference frame
+	var posed: Dictionary[String, Vector3] = {
+		"sitting": Vector3(-0.06919380277395248, 0.45828816294670105, 0.4638846516609192),
+		"writing": Vector3(-0.006603339221328497, 0.5209535360336304, 0.38666006922721863),
+		"drawing": Vector3(0.030383210629224777, 0.5343320965766907, 0.41277071833610535),
+		"reading": Vector3(-0.1393231749534607, 0.4699835777282715, 0.39249011874198914),
+		"finished": Vector3(-0.06922832131385803, 0.4532555937767029, 0.46624812483787537),
+	}
+	assert_eq(clip.reference_splats[248], 84699, "sample 248 is splat 84699")
+	for take: SplatClip.Take in clip.takes:
+		assert_eq(take.frame_count, 240, "%s frames" % take.name)
+		assert_eq(take.fps, 30.0, "%s fps" % take.name)
+		assert_eq(take.bones.size(), 240 * 9 * 12, "%s bone floats" % take.name)
+		assert_near(take.duration(), 8.0, "%s duration" % take.name)
+		var o: int = (100 * 9 + 6) * SplatClipScript.BONE_STRIDE
+		var want: Array = expected[take.name]
+		assert_eq(is_equal_approx(take.bones[o], want[0]) and is_equal_approx(take.bones[o + 9], want[1])
+				and is_equal_approx(take.bones[o + 10], want[2]) and is_equal_approx(take.bones[o + 11], want[3]), true,
+				"%s bone 6 at frame 100" % take.name)
+		if take.name == "typing":
+			continue
+		assert_eq(take.reference_frame, 89, "%s reference frame" % take.name)
+		assert_eq(take.reference_positions.size(), 256 * 3, "%s reference positions" % take.name)
+		var at: Vector3 = Vector3(take.reference_positions[248 * 3], take.reference_positions[248 * 3 + 1], take.reference_positions[248 * 3 + 2])
+		assert_eq(at.is_equal_approx(posed[take.name]), true, "%s posed sample 248 (%s)" % [take.name, at])
+		# the skinning is ink-studio's in every clip: pose the samples with this clip's bones and compare
+		var worst: float = 0.0
+		for s: int in clip.reference_splats.size():
+			var so: int = clip.reference_splats[s] * SplatClipScript.STRIDE
+			var p: Vector3 = Vector3(clip.splats[so], clip.splats[so + 1], clip.splats[so + 2])
+			var moved: Vector3 = _bone_of(take.bones, clip.bone_count, take.reference_frame, int(clip.splats[so + 12]), p)
+			var weight: float = clip.splats[so + 14]
+			if weight > 0.0:
+				moved += (_bone_of(take.bones, clip.bone_count, take.reference_frame, int(clip.splats[so + 13]), p) - moved) * weight
+			worst = maxf(worst, moved.distance_to(Vector3(take.reference_positions[s * 3], take.reference_positions[s * 3 + 1], take.reference_positions[s * 3 + 2])))
+		assert_eq(worst < 0.0001, true, "%s skinning matches ink-studio's posed positions (worst %s m)" % [take.name, worst])
 
 
 # The file carries ink-studio's own posed positions for a sample of splats: pose them here and compare.
@@ -116,8 +236,11 @@ func _test_skinning(clip: SplatClip) -> void:
 
 
 func _bone(clip: SplatClip, frame: int, bone: int, p: Vector3) -> Vector3:
-	var b: int = (frame * clip.bone_count + bone) * SplatClipScript.BONE_STRIDE
-	var m: PackedFloat32Array = clip.bones
+	return _bone_of(clip.bones, clip.bone_count, frame, bone, p)
+
+
+func _bone_of(m: PackedFloat32Array, bone_count: int, frame: int, bone: int, p: Vector3) -> Vector3:
+	var b: int = (frame * bone_count + bone) * SplatClipScript.BONE_STRIDE
 	return Vector3(
 		m[b] * p.x + m[b + 1] * p.y + m[b + 2] * p.z + m[b + 9],
 		m[b + 3] * p.x + m[b + 4] * p.y + m[b + 5] * p.z + m[b + 10],
@@ -130,7 +253,9 @@ func _test_sections() -> void:
 	if not assert_eq(clip != null, true, "a one-splat clip reads (%s)" % SplatClipScript.last_error):
 		return
 	assert_eq(clip.splat_count, 1, "one-splat clip count")
-	assert_eq(clip.skipped_sections.size(), 0, "no sections")
+	assert_eq(clip.sections.size(), 0, "no sections")
+	assert_eq(clip.has_look(), false, "no wardrobe")
+	assert_eq(clip.takes.size(), 1, "one clip")
 
 	# LOOK: one piece "hat", a piece per splat, one region "top" of two colours
 	var look: PackedByteArray = "LOOK".to_ascii_buffer()
@@ -138,7 +263,7 @@ func _test_sections() -> void:
 	look.append_array("hat".to_utf8_buffer())
 	look.append_array(_ints([0, 1, 3]))
 	look.append_array("top".to_utf8_buffer())
-	look.append_array(_ints([2, 0, 0]))
+	look.append_array(_ints([2, 0, 1]))
 	# CLPS: the header's clip "idle" (no frames here, reference -1), then "wave": 1 frame, a reference at frame 0
 	var clips: PackedByteArray = "CLPS".to_ascii_buffer()
 	clips.append_array(_ints([2, 4]))
@@ -149,17 +274,39 @@ func _test_sections() -> void:
 	clips.append_array("wave".to_utf8_buffer())
 	clips.append_array(_ints([1]))
 	clips.append_array(_floats([30.0]))
-	clips.append_array(_floats([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]))
+	clips.append_array(_floats([1, 0, 0, 0, 1, 0, 0, 0, 1, 0.5, 0, 0]))
 	clips.append_array(_ints([0]))
-	clips.append_array(_floats([0, 0, 0]))
+	clips.append_array(_floats([0.5, 1, 0]))
 
 	var both: PackedByteArray = plain.duplicate()
 	both.append_array(look)
 	both.append_array(clips)
 	clip = SplatClipScript.read(both)
 	if assert_eq(clip != null, true, "a clip with LOOK and CLPS reads (%s)" % SplatClipScript.last_error):
-		assert_eq(clip.skipped_sections, PackedStringArray(["LOOK", "CLPS"]), "both sections are read past")
+		assert_eq(clip.sections, PackedStringArray(["LOOK", "CLPS"]), "both sections are read")
 		assert_eq(clip.unknown_section, "", "nothing unknown")
+		assert_eq(clip.pieces, PackedStringArray(["hat"]), "the piece is named")
+		assert_eq(clip.piece_of, PackedInt32Array([0]), "the splat is of it")
+		assert_eq(clip.regions.keys(), ["top"], "the region is named")
+		assert_eq(clip.regions["top"], PackedInt32Array([0, 1]), "with its palette indices")
+		assert_eq(clip.takes.size(), 2, "two clips")
+		assert_eq(clip.takes[0].name, "idle", "the header's clip takes its name from the section")
+		assert_eq(clip.takes[0].frame_count, 1, "and keeps the header's frames")
+		assert_eq(clip.takes[1].name, "wave", "the second clip is named")
+		assert_eq(clip.takes[1].frame_count, 1, "with its own frames")
+		assert_eq(clip.takes[1].bones[9], 0.5, "and its own bones")
+		assert_eq(clip.takes[1].reference_frame, 0, "its reference frame")
+		assert_eq(clip.takes[1].reference_positions, PackedFloat32Array([0.5, 1, 0]), "and its posed sample")
+		assert_eq(clip.find("wave") == clip.takes[1], true, "a clip is found by name")
+
+	# the sections may come in the other order
+	var swapped: PackedByteArray = plain.duplicate()
+	swapped.append_array(clips)
+	swapped.append_array(look)
+	clip = SplatClipScript.read(swapped)
+	if assert_eq(clip != null, true, "CLPS before LOOK reads (%s)" % SplatClipScript.last_error):
+		assert_eq(clip.sections, PackedStringArray(["CLPS", "LOOK"]), "in the file's order")
+		assert_eq(clip.pieces.size() == 1 and clip.takes.size() == 2, true, "with both read")
 
 	var unknown: PackedByteArray = plain.duplicate()
 	unknown.append_array(clips)
@@ -168,8 +315,66 @@ func _test_sections() -> void:
 	clip = SplatClipScript.read(unknown)
 	if assert_eq(clip != null, true, "an unknown section does not fail the read (%s)" % SplatClipScript.last_error):
 		assert_eq(clip.unknown_section, "WXYZ", "the unknown section is named")
-		assert_eq(clip.skipped_sections, PackedStringArray(["CLPS"]), "the section before it is still read past")
+		assert_eq(clip.sections, PackedStringArray(["CLPS"]), "the section before it is still read")
+		assert_eq(clip.takes.size(), 2, "with its clips")
 		assert_eq(clip.splat_count, 1, "the clip before it is intact")
+
+
+# A section that is there but wrong fails the read, and says which section and why.
+func _test_section_refusals() -> void:
+	var plain: PackedByteArray = _tiny_clip()
+	# a splat of piece 3 where there is one piece
+	_refused(plain, _look_section(3, [0, 1]), "LOOK", "a splat that names a piece the file does not have")
+	# a region that names palette entry 2 of 2
+	_refused(plain, _look_section(0, [0, 2]), "LOOK", "a region that names a colour the palette does not have")
+	# a wardrobe cut short
+	var cut: PackedByteArray = _look_section(0, [0, 1])
+	cut.resize(cut.size() - 4)
+	_refused(plain, cut, "LOOK", "a wardrobe cut short")
+	# the first clip must be the header's
+	_refused(plain, _clips_section(1, 30.0, 0, "wave"), "CLPS", "a first clip with frames of its own")
+	# two clips of one name
+	_refused(plain, _clips_section(0, 30.0, 0, "idle"), "CLPS", "two clips of one name")
+	# a reference frame the clip does not have
+	_refused(plain, _clips_section(0, 30.0, 5, "wave"), "CLPS", "a reference frame out of range")
+	# no frames a second
+	_refused(plain, _clips_section(0, 0.0, 0, "wave"), "CLPS", "a clip with no frame rate")
+	assert_eq(SplatClipScript.read(plain + _look_section(0, [0, 1]) + _clips_section(0, 30.0, 0, "wave")) != null, true,
+			"and the same sections, right, are read")
+
+
+func _refused(plain: PackedByteArray, section: PackedByteArray, mark: String, what: String) -> void:
+	var clip: SplatClip = SplatClipScript.read(plain + section)
+	assert_eq(clip == null and SplatClipScript.last_error.contains(mark), true, "%s is refused, by section (%s)" % [what, SplatClipScript.last_error])
+
+
+# LOOK: one piece "hat", the one splat's piece, one region "top" of two palette indices.
+func _look_section(piece: int, indices: Array) -> PackedByteArray:
+	var look: PackedByteArray = "LOOK".to_ascii_buffer()
+	look.append_array(_ints([1, 3]))
+	look.append_array("hat".to_utf8_buffer())
+	look.append_array(_ints([piece, 1, 3]))
+	look.append_array("top".to_utf8_buffer())
+	look.append_array(_ints([2, indices[0], indices[1]]))
+	return look
+
+
+# CLPS: the header's clip "idle" with [param first_frames] frames of its own (0 is right), then a clip
+# of one frame at [param fps], posed for reference at [param reference].
+func _clips_section(first_frames: int, fps: float, reference: int, second: String) -> PackedByteArray:
+	var clips: PackedByteArray = "CLPS".to_ascii_buffer()
+	clips.append_array(_ints([2, 4]))
+	clips.append_array("idle".to_utf8_buffer())
+	clips.append_array(_ints([first_frames]))
+	clips.append_array(_floats([30.0]))
+	clips.append_array(_ints([-1, 4]))
+	clips.append_array(second.to_utf8_buffer())
+	clips.append_array(_ints([1]))
+	clips.append_array(_floats([fps]))
+	clips.append_array(_floats([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]))
+	clips.append_array(_ints([reference]))
+	clips.append_array(_floats([0, 0, 0]))
+	return clips
 
 
 func _test_refusals() -> void:

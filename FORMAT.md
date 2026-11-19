@@ -1,6 +1,6 @@
 # The TCRS splat file format
 
-Format versions 1, 2 and 3. This document, revision 5 (2026-11-19): the format is unchanged; wording only. Revision 4 added whose sun a prop's four bakes are lit by.
+Format versions 1, 2 and 3. This document, revision 6 (2026-11-19): the format is unchanged; the two optional sections are spelled out as this addon's reader now reads them, and two reference files have them. Revision 5 was wording only. Revision 4 added whose sun a prop's four bakes are lit by.
 
 A TCRS file (`.bytes`) holds one splat asset: a prop, or a boned character with a clip. It is written by `tools/export.js` in this repository from an ink-studio scene, and read by this addon's `splat_clip.gd`. The format was first read by a Unity renderer of the same design, which is why some of its conventions are Unity's.
 
@@ -61,6 +61,21 @@ A prop has B = F = R = S = 0, so those parts are empty.
 
 A name is an int32 length (1 to 256) and that many bytes of UTF-8.
 
+**A wardrobe** holds every piece whole: a hairstyle and the hair that shows under a hat, a plain top and a patterned one, each with all its splats. A drawer shows the pieces it is told to and the splats of no piece (-1), and nothing else.
+
+- 1 to 1024 pieces. A splat's piece is -1 or an index into them.
+- 0 to 256 regions, each of 1 to 256 palette indices. A region is a ramp a drawer may recolour: it replaces those palette entries, dark to light, with as many colours of its own.
+- **A splat carries its colour, not its palette index.** So each colour of a region is in the palette once, and a splat of that colour is that region's. The exporter refuses a scene where a region's colour is there twice.
+- The light data's ramps are palette indices too, so a recoloured region is relit along its new colours.
+- The names are the scene's own. The sample files name a piece `slot:name` (`hair:bun`, `top:stripes`), which the format does not know about.
+
+**More clips** share the header's rig: the same B bones in the same order, and the same S sample splats.
+
+- 1 to 256 clips, each name there once.
+- The first is the header's own clip, here only to be named: 0 frames (its fps is not read), reference frame -1. A file with no `CLPS` section has one clip with no name.
+- Every later clip has more than 0 frames, an fps above 0, and a reference frame that is -1 or one of its own frames.
+- A part a clip hides is parked by its bone, far below the floor (see "A splat"). Mixing two clips' bones for a fade must not mix such a bone: it would carry the part through the picture. This addon gives a bone that either clip parks the new clip's matrix at once.
+
 ## A splat
 
 Sixteen floats, ink-studio's own record:
@@ -87,4 +102,11 @@ The sun is the game's own, not part of the format: the exporter takes it from th
 
 ## Reference files
 
-Four files every reader must read identically: `mug.bytes`, `teapot.bytes` and `desk-set.bytes` (version 2), and `avatar-b.bytes` (version 3, 8 bones, 240 frames). None has a `LOOK` or `CLPS` section. They are in `dev/samples/`, and `dev/tests/test_splat_clip.gd` holds numbers read from them with an independent script, checks skinning against the posed positions stored in `avatar-b.bytes`, and builds small files of its own for the two optional sections.
+Six files every reader must read identically, in `dev/samples/`:
+
+- `mug.bytes`, `teapot.bytes` and `desk-set.bytes`: version 2.
+- `avatar-b.bytes`: version 3, 8 bones, 240 frames, no optional section.
+- `avatar-a-stand.bytes`: version 3, 8 bones, with `LOOK` (13 pieces, 7 regions) and a `CLPS` that only names its one clip.
+- `avatar-a.bytes`: version 3, 9 bones, with `LOOK` (17 pieces, 7 regions) and `CLPS` (6 clips of 240 frames).
+
+`dev/tests/test_splat_clip.gd` holds numbers read from them with an independent script, checks skinning against the posed positions each file stores (for every clip of `avatar-a.bytes`), and builds small files of its own for what a reader must refuse.

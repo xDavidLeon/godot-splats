@@ -27,6 +27,7 @@ Then, with a Godot 4.7 binary (the standard build is enough; exporting needs its
     godot --path <folder> -s res://splats/tools/splat_report.gd     captures beside ink-studio's renders; needs a window
     godot --path <folder> -s res://splats/tools/splat_light_report.gd   lamps, dusk and floor shadows in a room; needs a
                                                                     window, and a room's assets given with --samples
+    godot --path <folder> -s res://splats/tools/splat_wardrobe_report.gd   eight looks and every clip; needs a window
 
 --overlay makes the project for the transparent click-through window: its main scene is the overlay
 and it has the two project settings that window needs, which are read at start-up. Run it with

@@ -57,6 +57,40 @@ In the assembled project the addon is at `res://addons/splats`, and `dev/demo`, 
 
 `res://splats/demo/splat_demo.tscn` does exactly this; run it with F6.
 
+## A wardrobe
+
+A file may hold a wardrobe (`SplatClip.has_look()`): every piece whole (`SplatClip.pieces`), and colour regions (`SplatClip.regions`), each a ramp of the palette. An instance of it wears a look:
+
+```gdscript
+avatar.wear(["body", "top:stripes", "bottom:trousers", "shoes:shoes", "hair:bun", "accessory:glasses-round"],
+		{"top": [0x28475c, 0x3f6f8a, 0x5aaab3], "hair": [0x1b1618, 0x2a2226, 0x4a4044]})
+```
+
+- **Pieces:** the ones named are drawn, with the splats of no piece. A name the file does not have is passed over.
+- **Colours:** a region named takes that ramp, dark to light, with as many colours as the file's own; one not named keeps the file's. A ramp of another length is refused, and nothing changes.
+- **Until `wear` is called the whole wardrobe is drawn at once,** in the file's colours: every hairstyle on one head. `wear_everything()` goes back to that.
+- **Every instance wears its own look.** The file is read once and shared.
+- **A change of look rebuilds nothing.** Every splat of the wardrobe is in the scene's texture from the start; which pieces show, and the palette, are one row of a small texture for each instance, and the instance's light ramps are rows of another. `wear` on a drawn instance writes those rows (0.15 ms, measured; a rebuild of that scene took 14 ms). The price is that the pieces not worn are still handed to the vertex shader, which drops them.
+- **Lamps and dusk follow the look:** a recoloured region is lit along its new ramp.
+- **The picture's palette has room for 128 colours** (`SplatScene.MAX_PALETTE`), and every look brings its own. Eight looks of the sample avatar and a floor came to 114.
+
+Which pieces make a look, and how one picked colour becomes a ramp, are the game's own business: the names are the art's, and this addon knows none of them. `dev/tools/splat_wardrobe_report.gd` shows one way, for the sample avatar.
+
+## Clips
+
+A file may hold several named clips on its one rig (`SplatClip.takes`; `find` and `index_of` look one up). An instance plays one, or shows two mixed:
+
+```gdscript
+avatar.play("typing")                    # on the scene's clock, plus the instance's time_offset
+avatar.play("finished", 0.4)             # or at a time of the clip's own, in seconds
+avatar.cross_fade("typing", 5.2, "finished", 0.1, 0.25)   # a quarter of the way from one to the other
+```
+
+- **A name the file does not have plays its first clip,** so a file with one clip plays it whatever is asked.
+- **The instance keeps no clock and no fade.** `cross_fade` is one frame of a change of clip: the clip being left and its time, the new clip and its time, and how much of the new one shows. The caller decides when the change starts, how long it takes and how it eases, calls `cross_fade` each frame with the weight as far as it has got, and then `play`.
+- **Bones are mixed entry by entry** (`SplatClip.blend_bones`). A part that either clip hides takes the new clip's pose at once: mixed, it would fly up from where hidden parts are parked.
+- **A fade is the CPU's work for that instance only:** its bones for the frame, a hundred or so numbers. Nothing is rebuilt.
+
 ## Light
 
 A scene that sets none of this draws its assets' baked colours, as before. All of it needs the files' light data (props, and clips built with `"light": true`); a file without it keeps its colours.
@@ -77,7 +111,7 @@ None of it costs a rebuild or any work on the CPU: the rules run in the shaders 
 | Present | `shaders/splat_present.gdshader` | Nearest-neighbour scale-up, alpha clipped. |
 
 - **No compute or geometry shaders.** Splats, instances, bones and light data are float textures read with `texelFetch` in the vertex shader. It runs in Forward+, Mobile and the Compatibility renderer, with the same picture.
-- **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed. The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn.
+- **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed (every frame of a fade). The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn; a change of look or of clip does not rebuild it.
 
 ## Differences from the Unity renderer
 
@@ -90,6 +124,10 @@ None of it costs a rebuild or any work on the CPU: the rules run in the shaders 
   - Moving a lamp or a shadow rebuilds nothing, and there is no count of how many splats a lamp changed.
   - A shadow is marked in the samples and darkened by the pixel look, where Unity multiplied the samples' colour. The colours come out the same.
   - Floor shadows are off until `floor_shadows` is set, and the sun, the floor's height, a lamp's reach and strength are the scene's and the lamp's own properties.
+- **A look is worn in the shader.** The Unity renderer made a new clip of only the shown splats, recoloured, for every look, and rebuilt its buffers. Here the whole wardrobe stays in the texture and a change of look writes a few rows. So an undressed instance is drawn whole, where Unity's picked the first piece of each kind by its name, and the scene's splat count includes the pieces not worn (`shown_splat_count()` leaves them out).
+- **A fade is timed by the caller.** The Unity instance started a 0.3 second eased fade itself whenever its clip changed. Here the instance is handed both clips, their times and the weight.
+- **An unknown section at the end of a file stops the read there and keeps what came before** (`SplatClip.unknown_section` names it). The Unity reader refused the file.
+- **One renderer.** The Unity project had a second one for a single avatar in a transparent window, which sorted its splats and blended them, and so could draw splats with a density below 1 as soft dabs. This one draws only solid splats. None of the 63 files that project built has a splat below density 1 (every one of 694,606 is solid), and nor has any sample here, so nothing is lost by it; a file that had some would be drawn without them. What does differ is the edge of a solid splat: blended there, cut out here, which the pixel look then resolves the same way.
 
 ## Web export
 
@@ -120,7 +158,7 @@ Tried on 2026-11-18 with Godot 4.7.2: the demo scene, exported for the web (sing
 
 ## Not ported
 
-The wardrobe (`LOOK`) and extra clips (`CLPS`): both sections are read past, clip cross-fades, particles, and the editing overlays (the tinted ghost and the marks).
+Particles, and the editing overlays (the tinted ghost and the marks).
 
 ## Checking it
 
@@ -141,6 +179,14 @@ godot --path <folder> -s res://splats/tools/splat_light_report.gd -- --reference
 ```
 
 It draws a room by day, at dusk and with a lamp, beside reference renders of the same room when it is given some, checks the shaders' light against `SplatLight`'s rules, and measures a frame and a rebuild.
+
+The wardrobe and the clips have one too, which needs a window and nothing but the samples:
+
+```sh
+godot --path <folder> -s res://splats/tools/splat_wardrobe_report.gd -- --reference=<folder with avatar-looks.png>
+```
+
+It draws eight looks of the sample avatar in a row (on a floor, if `floor.bytes` was handed to `make_project.py --samples`), under a reference render of the same row when it is given one, and one avatar at its desk through every clip with a fade between, as 180 frames to make a GIF of. It checks that neither a change of look nor of clip rebuilds anything and that each look's colours and pieces are in the picture, and prints what a change of look costs. `dev/comparisons/wardrobe-looks.png` is the row (the Unity render above, this addon below) and `dev/comparisons/clips.gif` the clips.
 
 ## Licence
 

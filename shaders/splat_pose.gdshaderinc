@@ -4,12 +4,18 @@
 
 // 16 floats a splat in 4 texels, row after row:
 //   (x, y, z, density) (c00, c01, c02, packed colour) (c11, c12, c22, kind) (bone, second bone, its weight, instance)
+// A splat of a wardrobe carries more in two of those. Its last float is its instance plus 4096 times
+// (its piece + 1), so 0 there is a splat of no piece. And where its colour is one of a colour region's,
+// the packed colour is -(1 + that colour's palette index).
 uniform sampler2D splats : filter_nearest, repeat_disable;
 // 16 floats an instance in 4 texels, one instance a row: its 3x4 object-to-world by rows, then
 //   (first bone, first ramp, depth bias in metres, 1 if it casts a floor shadow)
 uniform sampler2D instances : filter_nearest, repeat_disable;
 // 12 floats a bone in 3 texels: every instance's bones for this frame, end to end
 uniform sampler2D bones : filter_nearest, repeat_disable;
+// What each instance wears, one instance a row. Texel n: x is 1 when the instance shows its piece n,
+// y is its palette's colour n, packed. Only wardrobe splats read it.
+uniform sampler2D looks : filter_nearest, repeat_disable;
 uniform int splats_width = 1024; // texels in a row of the splat texture: a multiple of 4
 uniform int bones_width = 768;   // texels in a row of the bone texture: a multiple of 3
 
@@ -34,7 +40,8 @@ void bone(int index, out mat3 m, out vec3 t) {
 }
 
 // A splat where it stands in the world this frame. False for one that is not drawn: a soft splat (the
-// renderer draws only solid ones) or a hidden part (ink-studio parks it at y = -99).
+// renderer draws only solid ones), a hidden part (ink-studio parks it at y = -99), or a splat of a
+// wardrobe piece its instance does not wear.
 //   at: its centre. carry: what took its own space to the world's (its bone, then its instance), for
 //   its covariance and its normal. colour_packed: its colour. of_instance: its instance's last texel.
 bool pose_splat(int splat, out vec3 at, out mat3 cov, out mat3 carry, out float colour_packed, out vec4 of_instance) {
@@ -53,7 +60,15 @@ bool pose_splat(int splat, out vec3 at, out mat3 cov, out mat3 carry, out float 
 	vec3 p = s0.xyz;
 	cov = mat3(vec3(s1.x, s1.y, s1.z), vec3(s1.y, s2.x, s2.y), vec3(s1.z, s2.y, s2.z)); // symmetric
 	colour_packed = s1.w;
-	int inst = int(s3.w);
+	int tag = int(s3.w);
+	int inst = tag % 4096;
+	int piece = tag / 4096; // 0: of no piece
+	if (piece > 0 && texelFetch(looks, ivec2(piece - 1, inst), 0).x < 0.5) {
+		return false;
+	}
+	if (colour_packed < 0.0) {
+		colour_packed = texelFetch(looks, ivec2(int(-colour_packed) - 1, inst), 0).y;
+	}
 	vec4 i0 = texelFetch(instances, ivec2(0, inst), 0);
 	vec4 i1 = texelFetch(instances, ivec2(1, inst), 0);
 	vec4 i2 = texelFetch(instances, ivec2(2, inst), 0);

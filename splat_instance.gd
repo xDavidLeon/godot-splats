@@ -1,8 +1,18 @@
 ## One splat asset placed in a 3D scene, drawn by the [SplatScene] that has it under its
 ## [member SplatScene.instances_root]. Its transform places the asset's own space (ink-studio's:
 ## metres, Y up), so it is moved, turned, scaled and hidden like any node.
+##
+## [b]A wardrobe.[/b] An asset that holds one ([method SplatClip.has_look]) holds every piece whole.
+## [method wear] says which pieces this instance shows and which colours each region takes; until it
+## is called every piece is drawn at once, in the file's own colours.
+##
+## [b]Clips.[/b] An asset may hold several named clips on its one rig ([member SplatClip.takes]).
+## [method play] picks one, and [method cross_fade] shows two mixed, bone by bone. The instance keeps
+## no clock and no fade of its own: whoever calls decides when a change of clip starts, how long it
+## takes and how it eases, and hands in the weight.
 # In Unity, this is the SplatInstance MonoBehaviour with a TextAsset; Godot has no TextAsset, so the
-# asset is a path to the .bytes file, read once and shared.
+# asset is a path to the .bytes file, read once and shared. Unity's instance made a new clip of the
+# shown splats for every look and timed its own fades (0.3 s, eased).
 class_name SplatInstance
 extends Node3D
 
@@ -19,7 +29,12 @@ static var _clips: Dictionary[String, SplatClip] = {}
 	set(value):
 		asset = value
 		_clip = null
+		_look_palette = PackedInt32Array()
 		version += 1
+
+## Clips only: which of the file's clips plays, by name. Empty, or a name the file does not have:
+## the file's first.
+@export var clip_name: String = ""
 
 ## Clips only: seconds added to the clock, so avatars don't move in step.
 @export var time_offset: float = 0.0
@@ -36,7 +51,26 @@ static var _clips: Dictionary[String, SplatClip] = {}
 ## lies on a surface.
 @export var casts_shadow: bool = true
 
+## The time [member clip_name] is shown at, in seconds of that clip's own. Negative: the scene's
+## clock plus [member time_offset].
+var clip_time: float = -1.0
+
+## The clip being left while a fade runs, by name. See [method cross_fade].
+var fade_from: String = ""
+## The time the clip being left is shown at, in seconds of its own.
+var fade_from_time: float = 0.0
+## How much of [member clip_name] shows, 0 to 1. From 1 on there is no fade.
+var fade_weight: float = 1.0
+
+## Bumped whenever the look changes ([method wear]), so a scene that draws this instance gives it,
+## and only it, its new pieces and colours.
+var look_version: int = 0
+
 var _clip: SplatClip = null
+var _wears: bool = false
+var _shown: PackedStringArray = PackedStringArray()
+var _ramps: Dictionary = {}
+var _look_palette: PackedInt32Array = PackedInt32Array()
 # endregion
 
 
@@ -63,7 +97,7 @@ func get_clip() -> SplatClip:
 	return _clip
 
 
-## The frame to show at [param seconds] on the scene's clock.
+## The frame of the file's first clip to show at [param seconds] on the scene's clock.
 func frame_at(seconds: float) -> int:
 	var clip: SplatClip = get_clip()
 	if clip == null or frozen:
@@ -80,4 +114,137 @@ static func load_shared(path: String) -> SplatClip:
 		push_error("[SplatInstance] %s" % SplatClip.last_error)
 	_clips[path] = clip
 	return clip
+# endregion
+
+
+# region Wardrobe
+## Dresses an asset that holds a wardrobe: it shows the pieces named in [param shown] (and the
+## splats of no piece), and each region named in [param ramps] takes that ramp of colours
+## (0xRRGGBB, dark to light, as many as the file's own; see [member SplatClip.regions]). A piece or
+## a region the file does not have is passed over, and a region that is not named keeps the file's
+## colours. Returns false, changing nothing, when a ramp's length is not its region's.
+## [br]It costs the scene no rebuild: only this instance's pieces, palette and ramps are written
+## again. Calling it with what is already worn does nothing. An asset with no wardrobe ignores it.
+func wear(shown: PackedStringArray, ramps: Dictionary = {}) -> bool:
+	if _wears and shown == _shown and ramps == _ramps:
+		return true
+	var clip: SplatClip = get_clip()
+	var palette: PackedInt32Array = PackedInt32Array()
+	if clip != null and clip.has_look():
+		palette = clip.dressed_palette(ramps)
+		if palette.is_empty():
+			push_error("[SplatInstance] %s" % SplatClip.last_error)
+			return false
+	_wears = true
+	_shown = shown.duplicate()
+	_ramps = ramps.duplicate(true)
+	_look_palette = palette
+	look_version += 1
+	return true
+
+
+## Back to the whole wardrobe at once in the file's own colours, as before any [method wear].
+func wear_everything() -> void:
+	if not _wears:
+		return
+	_wears = false
+	_shown = PackedStringArray()
+	_ramps = {}
+	_look_palette = PackedInt32Array()
+	look_version += 1
+
+
+## Whether a piece of the wardrobe is drawn.
+func shows(piece: String) -> bool:
+	return not _wears or _shown.has(piece)
+
+
+## The pieces given to the last [method wear]; empty before any.
+func get_shown() -> PackedStringArray:
+	return _shown
+
+
+## How many of the asset's splats are drawn in the look it wears.
+func shown_splat_count() -> int:
+	var clip: SplatClip = get_clip()
+	if clip == null:
+		return 0
+	return clip.count_shown(_shown) if _wears else clip.splat_count
+
+
+## The asset's palette as this instance wears it: the file's, with the regions given to
+## [method wear] in their new colours.
+func look_palette() -> PackedInt32Array:
+	var clip: SplatClip = get_clip()
+	if clip == null:
+		return PackedInt32Array()
+	if not _wears or not clip.has_look():
+		return clip.palette
+	if _look_palette.is_empty():
+		# the look was given before the asset
+		_look_palette = clip.dressed_palette(_ramps)
+		if _look_palette.is_empty():
+			push_error("[SplatInstance] %s" % SplatClip.last_error)
+			_look_palette = clip.palette
+	return _look_palette
+# endregion
+
+
+# region Clips
+## Plays one of the asset's clips, by name, with no fade. [param seconds] is the time to show it
+## at, in seconds of the clip's own; leave it out and the clip runs on the scene's clock plus
+## [member time_offset]. A name the asset does not have plays its first clip.
+func play(clip: String, seconds: float = -1.0) -> void:
+	clip_name = clip
+	clip_time = seconds
+	fade_from = ""
+	fade_weight = 1.0
+
+
+## Shows two of the asset's clips mixed, for one frame of a change of clip: [param from_clip] at
+## [param from_seconds] and [param to_clip] at [param to_seconds] (each in seconds of its own
+## clip), with [param weight] of the second, 0 to 1. Call it every frame of the fade with the
+## weight as far as it has got, then [method play]. A part that either clip hides takes
+## [param to_clip]'s pose at once ([method SplatClip.blend_bones]).
+func cross_fade(from_clip: String, from_seconds: float, to_clip: String, to_seconds: float, weight: float) -> void:
+	clip_name = to_clip
+	clip_time = to_seconds
+	fade_from = from_clip
+	fade_from_time = from_seconds
+	fade_weight = clampf(weight, 0.0, 1.0)
+
+
+## The clip that plays: [member clip_name]'s, or the asset's first. [code]null[/code] with no asset.
+func get_take() -> SplatClip.Take:
+	var clip: SplatClip = get_clip()
+	if clip == null:
+		return null
+	var take: SplatClip.Take = clip.find(clip_name) if not clip_name.is_empty() else null
+	return take if take != null else clip.takes[0]
+
+
+## The scene's question each frame: this instance's bones at [param seconds] on the scene's clock,
+## written into [param into] from [param at]. Returns a stamp of what was written; give it back as
+## [param last_stamp] next time, and nothing is written when the bones have not changed (the same
+## frame of the same clip, and no fade running). A fade writes every time and returns -1.
+func write_bones(seconds: float, into: PackedFloat32Array, at: int, last_stamp: int) -> int:
+	var clip: SplatClip = get_clip()
+	if clip == null or clip.bone_count == 0:
+		return last_stamp
+	var count: int = clip.bone_count * SplatClip.BONE_STRIDE
+	var take_index: int = maxi(0, clip.index_of(clip_name))
+	var take: SplatClip.Take = clip.takes[take_index]
+	var frame: int = 0 if frozen else take.frame_at(clip_time if clip_time >= 0.0 else seconds + time_offset)
+	var leaving: SplatClip.Take = clip.find(fade_from) if fade_weight < 1.0 and not fade_from.is_empty() else null
+	if leaving == null or leaving == take:
+		var stamp: int = take_index * 0x1000000 + frame
+		if stamp == last_stamp:
+			return stamp
+		var from: int = frame * count
+		for f: int in count:
+			into[at + f] = take.bones[from + f]
+		return stamp
+	var leaving_frame: int = 0 if frozen else leaving.frame_at(fade_from_time)
+	SplatClip.blend_bones(leaving.bones, leaving_frame * count, take.bones, frame * count, fade_weight, clip.bone_count, into, at)
+	return -1
 # endregion

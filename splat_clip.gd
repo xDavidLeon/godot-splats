@@ -1,5 +1,7 @@
 ## A splat asset as [code]tools/export.js[/code] writes it (a "TCRS" [code].bytes[/code] file, see FORMAT.md):
-## a prop (version 2), a boned clip (version 1) or a boned clip with light data (version 3).
+## a prop (version 2), a boned clip (version 1) or a boned clip with light data (version 3). A file
+## may also hold a wardrobe ([member pieces], [member regions]) and more clips on its one rig
+## ([member takes]).
 ##
 ## The numbers are kept exactly as the file holds them: ink-studio's world, in metres, Y up and
 ## right-handed. That is Godot's own convention, so nothing is flipped here.
@@ -26,6 +28,12 @@ const STRIDE: int = 16
 const BONE_STRIDE: int = 12
 ## The splat kind that rides on bones; every other splat the format allows is plain (kind 0).
 const BONED_KIND: int = 12
+
+## A bone whose translation is below this y parks its part out of sight (ink-studio puts hidden
+## parts at y = -99); a splat posed below it is not drawn.
+const HIDDEN_BELOW_Y: float = -30.0
+## The name of a file's one clip when the file names none.
+const UNNAMED_CLIP: String = "clip"
 
 const _HEADER_BYTES: int = 56
 const _MAX_NAME_BYTES: int = 256
@@ -70,14 +78,154 @@ var ramp_of: PackedInt32Array = PackedInt32Array()
 var brightness: Array[PackedFloat32Array] = []
 ## Three floats per splat: its surface normal.
 var normals: PackedFloat32Array = PackedFloat32Array()
-## The marks of the optional sections that were read past: "LOOK" (a wardrobe) and "CLPS" (more
-## clips) are recognised and skipped.
-var skipped_sections: PackedStringArray = PackedStringArray()
+## A wardrobe (empty when the file has none): the names of the pieces the file holds, every one of
+## them whole. See [method has_look].
+var pieces: PackedStringArray = PackedStringArray()
+## The piece each splat belongs to (an index into [member pieces]), or -1 for one that always shows.
+var piece_of: PackedInt32Array = PackedInt32Array()
+## The colour regions of a wardrobe, by name: each a ramp of [member palette] indices, dark to light.
+var regions: Dictionary[String, PackedInt32Array] = {}
+## The clips on the file's one rig. Always at least one: the first is the file's own
+## ([member bones]), called [constant UNNAMED_CLIP] unless the file names its clips. A prop has one
+## with no frames.
+var takes: Array[Take] = []
+## The marks of the optional sections that were read, in the file's order: "LOOK" (a wardrobe) and
+## "CLPS" (more clips).
+var sections: PackedStringArray = PackedStringArray()
 ## The mark of a section this reader does not know, or empty. Sections carry no length, so reading
 ## stops there; everything before it is intact.
 var unknown_section: String = ""
 
 var _light_texels: PackedFloat32Array = PackedFloat32Array()
+var _look_splats: PackedFloat32Array = PackedFloat32Array()
+var _section_error: String = ""
+# endregion
+
+
+# region Clips
+## One named clip: its own frames on the file's one rig.
+class Take extends RefCounted:
+	var name: String = ""
+	var frame_count: int = 0
+	var fps: float = 0.0
+	## [constant SplatClip.BONE_STRIDE] floats per bone, the file's bone count per frame.
+	var bones: PackedFloat32Array = PackedFloat32Array()
+	## The skinning test's answer for this clip: the frame the file's sample splats
+	## ([member SplatClip.reference_splats]) were posed at, or -1 for none (the first clip's are the
+	## file's own).
+	var reference_frame: int = -1
+	## Three floats per sample splat, its posed position at [member reference_frame].
+	var reference_positions: PackedFloat32Array = PackedFloat32Array()
+
+	## The clip's length in seconds; 0 for a prop's.
+	func duration() -> float:
+		return frame_count / fps if frame_count > 0 else 0.0
+
+	## The frame to show at [param seconds], looping. Derived from the time, never accumulated.
+	func frame_at(seconds: float) -> int:
+		if frame_count <= 0:
+			return 0
+		return posmod(floori(seconds * fps), frame_count)
+
+
+## The clip of that name, or [code]null[/code].
+func find(clip_name: String) -> Take:
+	for take: Take in takes:
+		if take.name == clip_name:
+			return take
+	return null
+
+
+## Where the clip of that name is in [member takes], or -1.
+func index_of(clip_name: String) -> int:
+	for t: int in takes.size():
+		if takes[t].name == clip_name:
+			return t
+	return -1
+
+
+## Writes one frame's bones, two clips mixed, into [param into] from [param at]: [param bones_in_rig]
+## bones of [constant BONE_STRIDE] floats, each entry [param weight] of the way from
+## [param from_bones] (read from [param from_at]) to [param to_bones] (read from [param to_at]).
+## A part that either clip hides (its bone's y is below [constant HIDDEN_BELOW_Y]) takes
+## [param to_bones]'s matrix at once: mixing to or from there would fly it through the picture.
+static func blend_bones(from_bones: PackedFloat32Array, from_at: int, to_bones: PackedFloat32Array, to_at: int,
+		weight: float, bones_in_rig: int, into: PackedFloat32Array, at: int) -> void:
+	for bone: int in bones_in_rig:
+		var o: int = bone * BONE_STRIDE
+		var hidden: bool = from_bones[from_at + o + 10] < HIDDEN_BELOW_Y or to_bones[to_at + o + 10] < HIDDEN_BELOW_Y
+		for k: int in BONE_STRIDE:
+			var b: float = to_bones[to_at + o + k]
+			if hidden:
+				into[at + o + k] = b
+			else:
+				var a: float = from_bones[from_at + o + k]
+				into[at + o + k] = a + (b - a) * weight
+# endregion
+
+
+# region Wardrobe
+## True for a file that holds a wardrobe: every piece whole, to be shown or hidden, and colour
+## regions to be given other ramps.
+func has_look() -> bool:
+	return not pieces.is_empty()
+
+
+## The file's palette with each region in [param ramps] given other colours: a region's name to its
+## ramp, 0xRRGGBB, dark to light, as long as the file's own. A region the file does not have is
+## passed over, and one that is not named keeps its colours. Returns an empty array, and sets
+## [member last_error], when a ramp's length is not the region's.
+func dressed_palette(ramps: Dictionary) -> PackedInt32Array:
+	var dressed: PackedInt32Array = palette.duplicate()
+	for region: Variant in ramps:
+		if not regions.has(region):
+			continue
+		var indices: PackedInt32Array = regions[region]
+		var colours: PackedInt32Array = PackedInt32Array(ramps[region])
+		if colours.size() != indices.size():
+			last_error = "The %s region has %d colours; it was given %d." % [region, indices.size(), colours.size()]
+			return PackedInt32Array()
+		for c: int in indices.size():
+			dressed[indices[c]] = colours[c] & 0xFFFFFF
+	return dressed
+
+
+## How many splats a look shows: those of the pieces named in [param shown], and those of no piece.
+func count_shown(shown: PackedStringArray) -> int:
+	if not has_look():
+		return splat_count
+	var wanted: PackedByteArray = PackedByteArray()
+	wanted.resize(pieces.size())
+	for p: int in pieces.size():
+		wanted[p] = 1 if shown.has(pieces[p]) else 0
+	var count: int = 0
+	for piece: int in piece_of:
+		if piece < 0 or wanted[piece] == 1:
+			count += 1
+	return count
+
+
+## The splat records as [SplatScene] hands a wardrobe's to its shader: a splat whose colour is one of
+## a region's carries, in place of that colour, -(1 + its palette index), for the shader to look up
+## in the palette its instance wears. Every other splat is as the file holds it. Made once and kept.
+# A splat carries its colour, not its palette index. The exporter makes sure every region colour is
+# in the palette once, so the colour finds the index.
+func look_splats() -> PackedFloat32Array:
+	if _look_splats.size() == splats.size():
+		return _look_splats
+	var index_of_colour: Dictionary[float, int] = {}
+	for region: String in regions:
+		for index: int in regions[region]:
+			var packed: float = pack(palette[index])
+			if not index_of_colour.has(packed):
+				index_of_colour[packed] = index
+	_look_splats = splats.duplicate()
+	for i: int in splat_count:
+		var o: int = i * STRIDE + 7
+		var index: int = index_of_colour.get(_look_splats[o], -1)
+		if index >= 0:
+			_look_splats[o] = -(1.0 + index)
+	return _look_splats
 # endregion
 
 
@@ -167,6 +315,8 @@ static func read(bytes: PackedByteArray) -> SplatClip:
 	var clip: SplatClip = SplatClip.new()
 	var error: String = clip._parse(bytes)
 	if error.is_empty():
+		if clip.takes.is_empty():
+			clip.takes.append(clip._own_take(UNNAMED_CLIP))
 		return clip
 	last_error = error
 	return null
@@ -255,16 +405,17 @@ func _parse(bytes: PackedByteArray) -> String:
 	while size - at >= 4:
 		var mark: String = bytes.slice(at, at + 4).get_string_from_ascii()
 		var next: int = -1
+		_section_error = "it ends early"
 		if mark == "LOOK":
-			next = _skip_look(bytes, at + 4)
+			next = _parse_look(bytes, at + 4, palette_count)
 		elif mark == "CLPS":
-			next = _skip_clips(bytes, at + 4, samples)
+			next = _parse_clips(bytes, at + 4, samples)
 		else:
 			unknown_section = mark
 			break
 		if next < 0:
-			return "The %s section ends early or is out of range." % mark
-		skipped_sections.append(mark)
+			return "The %s section cannot be read: %s." % [mark, _section_error]
+		sections.append(mark)
 		at = next
 	return ""
 
@@ -306,68 +457,133 @@ func _parse_light(bytes: PackedByteArray, at: int, palette_count: int, expected_
 	return at + splat_count * 12
 
 
-# A wardrobe: piece names, a piece per splat, then named colour regions. Returns the offset after it, or -1.
-func _skip_look(bytes: PackedByteArray, at: int) -> int:
+# A wardrobe: piece names, a piece per splat, then named colour regions. Returns the offset after it,
+# or -1 with _section_error saying why.
+func _parse_look(bytes: PackedByteArray, at: int, palette_count: int) -> int:
 	var size: int = bytes.size()
 	if at + 4 > size:
 		return -1
-	var pieces: int = bytes.decode_s32(at)
+	var piece_count: int = bytes.decode_s32(at)
 	at += 4
-	if pieces <= 0 or pieces > 1024:
+	if piece_count <= 0 or piece_count > 1024:
+		_section_error = "its piece count is out of range"
 		return -1
-	for p: int in pieces:
-		at = _skip_name(bytes, at)
-		if at < 0:
+	var names: PackedStringArray = PackedStringArray()
+	for p: int in piece_count:
+		var name_end: int = _skip_name(bytes, at)
+		if name_end < 0:
+			_section_error = "a piece's name is out of range"
 			return -1
+		names.append(bytes.slice(at + 4, name_end).get_string_from_utf8())
+		at = name_end
+	if at + splat_count * 4 + 4 > size:
+		return -1
+	var of: PackedInt32Array = bytes.slice(at, at + splat_count * 4).to_int32_array()
 	at += splat_count * 4
-	if at + 4 > size:
-		return -1
-	var regions: int = bytes.decode_s32(at)
+	for piece: int in of:
+		if piece < -1 or piece >= piece_count:
+			_section_error = "a splat names a piece the file does not have"
+			return -1
+	var region_count: int = bytes.decode_s32(at)
 	at += 4
-	if regions < 0 or regions > 256:
+	if region_count < 0 or region_count > 256:
+		_section_error = "its region count is out of range"
 		return -1
-	for r: int in regions:
-		at = _skip_name(bytes, at)
-		if at < 0 or at + 4 > size:
+	var named: Dictionary[String, PackedInt32Array] = {}
+	for r: int in region_count:
+		var name_end: int = _skip_name(bytes, at)
+		if name_end < 0 or name_end + 4 > size:
+			_section_error = "a region's name is out of range"
 			return -1
-		var colours: int = bytes.decode_s32(at)
-		if colours <= 0 or colours > 256:
+		var region: String = bytes.slice(at + 4, name_end).get_string_from_utf8()
+		var colours: int = bytes.decode_s32(name_end)
+		at = name_end + 4
+		if colours <= 0 or colours > 256 or at + colours * 4 > size:
+			_section_error = "the %s region is out of range" % region
 			return -1
-		at += 4 + colours * 4
-		if at > size:
-			return -1
+		var indices: PackedInt32Array = bytes.slice(at, at + colours * 4).to_int32_array()
+		for index: int in indices:
+			if index < 0 or index >= palette_count:
+				_section_error = "the %s region names a colour the palette does not have" % region
+				return -1
+		named[region] = indices
+		at += colours * 4
+	pieces = names
+	piece_of = of
+	regions = named
 	return at
 
 
-# More named clips on the same rig. Returns the offset after them, or -1.
-func _skip_clips(bytes: PackedByteArray, at: int, samples: int) -> int:
+# More named clips on the same rig. Returns the offset after them, or -1 with _section_error saying why.
+func _parse_clips(bytes: PackedByteArray, at: int, samples: int) -> int:
 	var size: int = bytes.size()
 	if at + 4 > size:
 		return -1
-	var clips: int = bytes.decode_s32(at)
+	var clip_count: int = bytes.decode_s32(at)
 	at += 4
-	if clips <= 0 or clips > 256:
+	if clip_count <= 0 or clip_count > 256:
+		_section_error = "its clip count is out of range"
 		return -1
-	for c: int in clips:
-		at = _skip_name(bytes, at)
-		if at < 0 or at + 12 > size:
+	var read_takes: Array[Take] = []
+	for c: int in clip_count:
+		var name_end: int = _skip_name(bytes, at)
+		if name_end < 0 or name_end + 8 > size:
+			_section_error = "a clip's name is out of range"
 			return -1
-		var frames: int = bytes.decode_s32(at)
-		at += 8 # the frame count and the fps
-		if frames < 0:
+		var clip_name: String = bytes.slice(at + 4, name_end).get_string_from_utf8()
+		var frames: int = bytes.decode_s32(name_end)
+		var clip_fps: float = bytes.decode_float(name_end + 4)
+		at = name_end + 8
+		for earlier: Take in read_takes:
+			if earlier.name == clip_name:
+				_section_error = "two clips are called %s" % clip_name
+				return -1
+		if c == 0:
+			# the first clip is the header's: it only gets its name here
+			if frames != 0 or at + 4 > size or bytes.decode_s32(at) != -1:
+				_section_error = "its first clip must be the header's, with no frames of its own"
+				return -1
+			at += 4
+			read_takes.append(_own_take(clip_name))
+			continue
+		if frames <= 0 or clip_fps <= 0.0:
+			_section_error = "the clip %s is out of range" % clip_name
 			return -1
-		at += frames * bone_count * BONE_STRIDE * 4
-		if at + 4 > size:
+		var floats: int = frames * bone_count * BONE_STRIDE
+		if at + floats * 4 + 4 > size:
 			return -1
-		var reference: int = bytes.decode_s32(at)
+		var take: Take = Take.new()
+		take.name = clip_name
+		take.frame_count = frames
+		take.fps = clip_fps
+		take.bones = bytes.slice(at, at + floats * 4).to_float32_array()
+		at += floats * 4
+		take.reference_frame = bytes.decode_s32(at)
 		at += 4
-		if reference >= 0:
-			at += samples * 12
-		if at > size:
+		if take.reference_frame < -1 or take.reference_frame >= frames:
+			_section_error = "the clip %s's reference frame is out of range" % clip_name
 			return -1
+		if take.reference_frame >= 0:
+			if at + samples * 12 > size:
+				return -1
+			take.reference_positions = bytes.slice(at, at + samples * 12).to_float32_array()
+			at += samples * 12
+		read_takes.append(take)
+	takes = read_takes
 	return at
 
 
+# The header's clip as a take.
+func _own_take(clip_name: String) -> Take:
+	var take: Take = Take.new()
+	take.name = clip_name
+	take.frame_count = frame_count
+	take.fps = fps
+	take.bones = bones
+	return take
+
+
+# The offset after the name at [param at] (an int32 length, then that many bytes), or -1.
 func _skip_name(bytes: PackedByteArray, at: int) -> int:
 	if at + 4 > bytes.size():
 		return -1

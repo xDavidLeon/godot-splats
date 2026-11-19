@@ -10,7 +10,12 @@ extends SceneTree
 
 
 # region Lifecycle
-func _init() -> void:
+# Not in _init: a suite that draws needs the tree's root in the tree, which it is once the loop has started.
+func _initialize() -> void:
+	_run.call_deferred()
+
+
+func _run() -> void:
 	var folder: String = (get_script() as Script).resource_path.get_base_dir()
 	var files: PackedStringArray = PackedStringArray()
 	for file: String in DirAccess.get_files_at(folder):

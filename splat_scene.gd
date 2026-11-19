@@ -9,11 +9,22 @@
 ## quarter turn). Then [code]splat_resolve.gdshader[/code] makes the pixel look at the art resolution.
 ## Show [method get_picture] with nearest-neighbour filtering ([code]splat_present.gdshader[/code]).
 ##
-## Not ported from Unity: floor shadows, relighting by lamps and dusk, the wardrobe, clip cross-fades,
-## particles and the editing overlays.
-# In Unity, the draw is a CommandBuffer with DrawProcedural and StructuredBuffers. Here two
-# SubViewports do it: a 3D one (it has a depth buffer) holding one MultiMesh of quads, and a 2D one
-# for the resolve. Neither needs compute shaders, so the Compatibility renderer can run it.
+## Light, all of it off until asked for, so a scene that sets none of this draws its assets' bakes:
+## [br]- [b]Lamps:[/b] every [SplatLamp] under [member instances_root] lifts the splats near it and
+## facing it along the ramp each was shaded on.
+## [br]- [b]Dusk:[/b] [member dusk] takes every splat down its ramp by whole steps.
+## [br]- [b]Floor shadows:[/b] with [member floor_shadows], instances darken the floor under them,
+## away from [member sun].
+## [br]The rules are [SplatLight]'s. They run in the shaders every frame, so a lamp or a piece of
+## furniture that moves, the dusk falling and a clip playing cost the CPU nothing and rebuild nothing.
+## Only files with light data are lit again ([method SplatClip.has_light]); the others keep their colours.
+##
+## Not ported from Unity: the wardrobe, clip cross-fades, particles and the editing overlays.
+# In Unity, the draw is a CommandBuffer with DrawProcedural and StructuredBuffers, and lamps, dusk
+# and shadows were worked out on the CPU at each rebuild. Here SubViewports do it: a 3D one (it has a
+# depth buffer) holding one MultiMesh of quads, a 2D one for the resolve, and, only while floor
+# shadows are on, a small 3D one for the floor's grid. None needs compute shaders, so the
+# Compatibility renderer can run it.
 class_name SplatScene
 extends Node
 
@@ -21,13 +32,24 @@ extends Node
 # region Constants
 const DRAW_SHADER: Shader = preload("res://addons/splats/shaders/splat_scene_draw.gdshader")
 const RESOLVE_SHADER: Shader = preload("res://addons/splats/shaders/splat_resolve.gdshader")
+const SHADOW_CAST_SHADER: Shader = preload("res://addons/splats/shaders/splat_shadow_cast.gdshader")
+const SHADOW_SHADER: Shader = preload("res://addons/splats/shaders/splat_shadow.gdshader")
 
 ## Colours the pixel look can tell apart in one picture.
 const MAX_PALETTE: int = 128
+## Lamps that light one picture. More are left out, with a warning.
+const MAX_LAMPS: int = 16
+## Floor shadows fall within this many cells of where the camera looks, each way: 12.8 m with the
+## default [member shadow_cell].
+const SHADOW_REACH_CELLS: int = 256
 
 const _SPLATS_WIDTH: int = 1024       # texels in a row: 256 splats
 const _BONES_WIDTH: int = 768         # texels in a row: 256 bones
+const _LIGHTS_WIDTH: int = 1024       # texels in a row: 1024 splats' normals and ramps, or 4096 splats' brightness
 const _INSTANCE_FLOATS: int = 16
+const _SHADOW_HEIGHT: float = 0.004   # metres above the floor the shadow discs lie
+const _SHADOW_DEPTH_BIAS: float = 0.1 # metres nearer the camera they are depth-tested
+const _SHADOW_DISC: float = 0.75      # a disc's radius, in cells: neighbours overlap
 # endregion
 
 
@@ -57,6 +79,32 @@ enum Interior {
 ## With [constant Interior.AVERAGE] only: how much ordered noise is added to the average.
 @export_range(0.0, 0.3) var dither: float = 0.021
 
+@export_group("Light")
+## Whether the [SplatLamp]s under [member instances_root] light the picture.
+@export var lamp_light: bool = true
+
+## How far the day has dimmed, in steps of each splat's own colour ramp: 0 is the bake, and 2 reads
+## as evening. Splats with no ramp (glowing things) keep their colour.
+@export_range(0, 8) var dusk: int = 0
+
+## Whether instances darken the floor under them ([member SplatInstance.casts_shadow]).
+@export var floor_shadows: bool = false
+
+## The world's one sun, pointing at it (it need not be a unit vector, and must rise). Keep it equal
+## to the sun the assets were baked with: the game's manifest's, or the exporter's default, which
+## this is.
+@export var sun: Vector3 = Vector3(-0.3, 0.75, 0.6)
+
+## The height of the floor that shadows fall on, in metres.
+@export var floor_height: float = 0.0
+
+## The floor shadows' cell, in metres: a shadow is a disc on every cell something stands over.
+@export_range(0.02, 0.2, 0.005) var shadow_cell: float = 0.05
+
+## How much light a floor shadow leaves.
+@export_range(0.4, 1.0, 0.01) var shadow_light: float = 0.8
+
+@export_group("")
 ## The clips' clock in seconds. Negative: the engine's own time.
 @export var fixed_time: float = -1.0
 
@@ -72,6 +120,8 @@ var splat_count: int = 0
 var instance_count: int = 0
 ## Colours in the picture's palette at the last rebuild.
 var palette_count: int = 0
+## Lamps lighting the picture this frame.
+var lamp_count: int = 0
 ## How many times the big texture has been rebuilt.
 var rebuild_count: int = 0
 ## What the last frame cost this script, in milliseconds (uploads included, the GPU's work not).
@@ -83,6 +133,7 @@ var _instances: Array[SplatInstance] = []
 var _first_bone: PackedInt32Array = PackedInt32Array()
 var _last_frame: PackedInt32Array = PackedInt32Array()
 var _turns: PackedInt32Array = PackedInt32Array()
+var _first_ramp: PackedInt32Array = PackedInt32Array()
 var _built_version: int = -1
 var _built_art_size: Vector2i = Vector2i.ZERO
 
@@ -97,6 +148,16 @@ var _instance_texture: ImageTexture
 var _bone_data: PackedFloat32Array = PackedFloat32Array()
 var _bone_texture: ImageTexture
 var _bone_rows: int = 1
+var _lamps: Array[SplatLamp] = []
+var _built_lamp_version: int = -1
+var _lamp_root: Node = null
+var _lamp_data: PackedVector4Array = PackedVector4Array()
+var _lamp_strengths: PackedFloat32Array = PackedFloat32Array()
+var _shadow_viewport: SubViewport
+var _shadow_cast_material: ShaderMaterial
+var _shadow_material: ShaderMaterial
+var _shadow_plane: MeshInstance3D
+var _warned_sun: bool = false
 # endregion
 
 
@@ -116,9 +177,30 @@ func get_picture() -> ViewportTexture:
 	return _picture_viewport.get_texture()
 
 
-## The picture before the pixel look: twice the art resolution, coverage in alpha. For debugging.
+## The picture before the pixel look: twice the art resolution, coverage in alpha (a half where a
+## floor shadow falls on something). For debugging.
 func get_samples() -> ViewportTexture:
 	return _samples_viewport.get_texture()
+
+
+## The floor's grid from above, one texel a cell, marked where a shadow falls; [code]null[/code]
+## until floor shadows have been drawn. Its first texel is the cell [method get_shadow_first_cell]
+## gives, and a row is a step along z. For debugging.
+func get_shadow_cells() -> ViewportTexture:
+	return _shadow_viewport.get_texture() if _shadow_viewport != null else null
+
+
+## The floor cell (x, z) at the first texel of [method get_shadow_cells] this frame. Cell (x, z) spans
+## x × [member shadow_cell] to (x + 1) × [member shadow_cell] metres.
+func get_shadow_first_cell() -> Vector2i:
+	var eye: Transform3D = camera.global_transform
+	var forward: Vector3 = -eye.basis.z
+	var focus: Vector3 = eye.origin
+	if absf(forward.y) > 1e-4:
+		var t: float = (floor_height - eye.origin.y) / forward.y
+		if t > 0.0:
+			focus += forward * t
+	return Vector2i(floori(focus.x / shadow_cell), floori(focus.z / shadow_cell)) - Vector2i.ONE * SHADOW_REACH_CELLS
 
 
 ## Uploads what the picture needs for the clock at [param seconds]. [method _process] calls it; the
@@ -155,7 +237,9 @@ func draw(seconds: float) -> void:
 		_instance_data[o + 10] = to_world.basis.z.z
 		_instance_data[o + 11] = to_world.origin.z
 		_instance_data[o + 12] = _first_bone[i]
+		_instance_data[o + 13] = _first_ramp[i]
 		_instance_data[o + 14] = instance.depth_bias
+		_instance_data[o + 15] = 1.0 if instance.casts_shadow else 0.0
 		var clip: SplatClip = instance.get_clip()
 		if clip.bone_count == 0:
 			continue
@@ -177,30 +261,154 @@ func draw(seconds: float) -> void:
 	var orthographic: bool = camera.projection == Camera3D.PROJECTION_ORTHOGONAL
 	var lens: float = samples_height * 0.5 / (camera.size * 0.5) if orthographic \
 			else samples_height * 0.5 / tan(deg_to_rad(camera.fov) * 0.5)
+	var lens_vector: Vector4 = Vector4(lens, 1.0 if orthographic else 0.0, camera.near, camera.far)
 	_draw_material.set_shader_parameter(&"view", camera.global_transform.affine_inverse())
 	_draw_material.set_shader_parameter(&"size", Vector2(art_size * 2))
-	_draw_material.set_shader_parameter(&"lens", Vector4(lens, 1.0 if orthographic else 0.0, camera.near, camera.far))
+	_draw_material.set_shader_parameter(&"lens", lens_vector)
+	_light(lens_vector)
 	_resolve_material.set_shader_parameter(&"average_interior", interior == Interior.AVERAGE)
 	_resolve_material.set_shader_parameter(&"dither", dither)
 	last_cpu_msec = (Time.get_ticks_usec() - started) / 1000.0
 
 
-## What the two passes (draw and resolve) cost last frame, in milliseconds: x on the CPU, y on the
-## GPU. Zero unless [member measure_render_time] is on.
+## What the passes (the floor's shadow cells when they are on, draw and resolve) cost last frame, in
+## milliseconds: x on the CPU, y on the GPU. Zero unless [member measure_render_time] is on.
 func get_render_msec() -> Vector2:
 	if not measure_render_time or _samples_viewport == null:
 		return Vector2.ZERO
-	var draw: RID = _samples_viewport.get_viewport_rid()
-	var resolve: RID = _picture_viewport.get_viewport_rid()
-	return Vector2(
-			RenderingServer.viewport_get_measured_render_time_cpu(draw) + RenderingServer.viewport_get_measured_render_time_cpu(resolve),
-			RenderingServer.viewport_get_measured_render_time_gpu(draw) + RenderingServer.viewport_get_measured_render_time_gpu(resolve))
+	var total: Vector2 = Vector2.ZERO
+	for viewport: SubViewport in [_shadow_viewport, _samples_viewport, _picture_viewport]:
+		if viewport == null or viewport.render_target_update_mode == SubViewport.UPDATE_DISABLED:
+			continue
+		total.x += RenderingServer.viewport_get_measured_render_time_cpu(viewport.get_viewport_rid())
+		total.y += RenderingServer.viewport_get_measured_render_time_gpu(viewport.get_viewport_rid())
+	return total
 
 
 ## One line on what the picture holds and costs.
 func status() -> String:
-	return "%d splats in %d instances, %d colours, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
-		splat_count, instance_count, palette_count, art_size.x, art_size.y, last_cpu_msec, last_rebuild_msec]
+	return "%d splats in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
+		splat_count, instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off",
+		art_size.x, art_size.y, last_cpu_msec, last_rebuild_msec]
+# endregion
+
+
+# region Light
+# This frame's lamps, dusk and floor shadows: a few uniforms, and nothing when none is asked for.
+func _light(lens_vector: Vector4) -> void:
+	var root: Node = instances_root if instances_root != null else get_parent()
+	if _built_lamp_version != SplatLamp.version or _lamp_root != root:
+		_built_lamp_version = SplatLamp.version
+		_lamp_root = root
+		_lamps.clear()
+		_gather_lamps(root)
+		if _lamps.size() > MAX_LAMPS:
+			push_warning("[SplatScene] %d lamps; the picture is lit by the first %d." % [_lamps.size(), MAX_LAMPS])
+			_lamps.resize(MAX_LAMPS)
+	lamp_count = _lamps.size() if lamp_light else 0
+	for l: int in lamp_count:
+		var lamp: SplatLamp = _lamps[l]
+		var at: Vector3 = lamp.global_position
+		_lamp_data[l] = Vector4(at.x, at.y, at.z, maxf(lamp.radius, 0.001))
+		_lamp_strengths[l] = lamp.strength
+	_draw_material.set_shader_parameter(&"lamps", _lamp_data)
+	_draw_material.set_shader_parameter(&"lamp_strengths", _lamp_strengths)
+	_draw_material.set_shader_parameter(&"lamp_count", lamp_count)
+	_draw_material.set_shader_parameter(&"dusk", maxi(0, dusk))
+
+	var shadows: bool = _shadows_wanted()
+	if floor_shadows and sun.y <= 0.0 and not _warned_sun:
+		_warned_sun = true
+		push_warning("[SplatScene] The sun is not above the horizon; no floor shadows are drawn.")
+	if shadows and _shadow_viewport == null:
+		_build_shadow_pass()
+	if _shadow_viewport == null:
+		return
+	_shadow_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if shadows else SubViewport.UPDATE_DISABLED
+	_shadow_plane.visible = shadows
+	if not shadows:
+		return
+	var first_cell: Vector2 = Vector2(get_shadow_first_cell())
+	var across: float = SHADOW_REACH_CELLS * 2.0
+	_shadow_cast_material.set_shader_parameter(&"splats", _draw_material.get_shader_parameter(&"splats"))
+	_shadow_cast_material.set_shader_parameter(&"instances", _instance_texture)
+	_shadow_cast_material.set_shader_parameter(&"bones", _bone_texture)
+	_shadow_cast_material.set_shader_parameter(&"slope", Vector2(sun.x, sun.z) / sun.y)
+	_shadow_cast_material.set_shader_parameter(&"grid", Vector4(shadow_cell, floor_height, SplatLight.SHADOW_MIN_HEIGHT, across))
+	_shadow_cast_material.set_shader_parameter(&"first_cell", first_cell)
+	_shadow_material.set_shader_parameter(&"eye", camera.global_transform)
+	_shadow_material.set_shader_parameter(&"size", Vector2(art_size * 2))
+	_shadow_material.set_shader_parameter(&"lens", lens_vector)
+	_shadow_material.set_shader_parameter(&"grid", Vector4(shadow_cell, floor_height + _SHADOW_HEIGHT, _SHADOW_DISC, across))
+	_shadow_material.set_shader_parameter(&"first_cell", first_cell)
+	_shadow_material.set_shader_parameter(&"depth_bias", _SHADOW_DEPTH_BIAS)
+	_resolve_material.set_shader_parameter(&"shadow_light", shadow_light)
+
+
+func _shadows_wanted() -> bool:
+	return floor_shadows and sun.y > 0.0 and shadow_cell > 0.0 and splat_count > 0
+
+
+func _gather_lamps(node: Node) -> void:
+	if node == null:
+		return
+	if node is SplatLamp and (node as SplatLamp).is_visible_in_tree():
+		_lamps.append(node)
+	for child: Node in node.get_children():
+		_gather_lamps(child)
+
+
+# The floor's grid from above, one texel a cell, drawn by the same quads as the picture with another
+# shader; and one quad over the samples that reads it. Built the first time floor shadows are wanted.
+func _build_shadow_pass() -> void:
+	_shadow_viewport = SubViewport.new()
+	_shadow_viewport.name = "ShadowCells"
+	_shadow_viewport.own_world_3d = true
+	_shadow_viewport.transparent_bg = true
+	_shadow_viewport.size = Vector2i.ONE * SHADOW_REACH_CELLS * 2
+	_shadow_viewport.msaa_3d = Viewport.MSAA_DISABLED
+	_shadow_viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	_shadow_viewport.use_taa = false
+	_shadow_viewport.use_debanding = false
+	_shadow_viewport.positional_shadow_atlas_size = 0
+	add_child(_shadow_viewport)
+	move_child(_shadow_viewport, 0) # before the samples, which read it
+
+	var eye: Camera3D = Camera3D.new()
+	eye.environment = Environment.new()
+	_shadow_viewport.add_child(eye)
+	eye.make_current()
+
+	_shadow_cast_material = ShaderMaterial.new()
+	_shadow_cast_material.shader = SHADOW_CAST_SHADER
+	_shadow_cast_material.set_shader_parameter(&"splats_width", _SPLATS_WIDTH)
+	_shadow_cast_material.set_shader_parameter(&"bones_width", _BONES_WIDTH)
+	var everywhere: AABB = AABB(Vector3.ONE * -100000.0, Vector3.ONE * 200000.0)
+	var casters: MultiMeshInstance3D = MultiMeshInstance3D.new()
+	casters.multimesh = _multimesh
+	casters.material_override = _shadow_cast_material
+	casters.custom_aabb = everywhere
+	casters.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	casters.ignore_occlusion_culling = true
+	_shadow_viewport.add_child(casters)
+
+	var quad: ArrayMesh = ArrayMesh.new()
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-1, -1, 0), Vector3(1, -1, 0), Vector3(1, 1, 0), Vector3(-1, 1, 0)])
+	arrays[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2, 0, 2, 3])
+	quad.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	_shadow_material = ShaderMaterial.new()
+	_shadow_material.shader = SHADOW_SHADER
+	_shadow_material.set_shader_parameter(&"cells", _shadow_viewport.get_texture())
+	quad.surface_set_material(0, _shadow_material)
+	_shadow_plane = MeshInstance3D.new()
+	_shadow_plane.mesh = quad
+	_shadow_plane.custom_aabb = everywhere
+	_shadow_plane.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_shadow_plane.ignore_occlusion_culling = true
+	_samples_viewport.add_child(_shadow_plane)
+	RenderingServer.viewport_set_measure_render_time(_shadow_viewport.get_viewport_rid(), measure_render_time)
 # endregion
 
 
@@ -238,7 +446,10 @@ func _build_passes() -> void:
 	_draw_material.shader = DRAW_SHADER
 	_draw_material.set_shader_parameter(&"splats_width", _SPLATS_WIDTH)
 	_draw_material.set_shader_parameter(&"bones_width", _BONES_WIDTH)
+	_draw_material.set_shader_parameter(&"lights_width", _LIGHTS_WIDTH)
 	quad.surface_set_material(0, _draw_material)
+	_lamp_data.resize(MAX_LAMPS)
+	_lamp_strengths.resize(MAX_LAMPS)
 
 	var everywhere: AABB = AABB(Vector3.ONE * -100000.0, Vector3.ONE * 200000.0)
 	_multimesh = MultiMesh.new()
@@ -274,6 +485,8 @@ func _apply_measuring() -> void:
 		return
 	RenderingServer.viewport_set_measure_render_time(_samples_viewport.get_viewport_rid(), measure_render_time)
 	RenderingServer.viewport_set_measure_render_time(_picture_viewport.get_viewport_rid(), measure_render_time)
+	if _shadow_viewport != null:
+		RenderingServer.viewport_set_measure_render_time(_shadow_viewport.get_viewport_rid(), measure_render_time)
 
 
 # Gathers the instances and lays their splats end to end. Each splat's last float carries its instance.
@@ -293,6 +506,17 @@ func _rebuild() -> void:
 	_first_bone.resize(instance_count)
 	_last_frame.resize(instance_count)
 	_turns.resize(instance_count)
+	_first_ramp.resize(instance_count)
+
+	# Light data, for the shader to light splats again: each splat's normal and ramp, how bright its bake
+	# came out, and every file's ramps as rows of packed colours. Whole arrays are appended, so this costs
+	# no loop over the splats.
+	var lights: PackedFloat32Array = PackedFloat32Array()
+	var brights: PackedFloat32Array = PackedFloat32Array()
+	var ramp_rows: Array[PackedInt32Array] = []
+	var ramp_palettes: Array[PackedInt32Array] = []
+	var first_ramp_of: Dictionary[SplatClip, int] = {}
+	var longest_ramp: int = 1
 
 	var data: PackedFloat32Array = PackedFloat32Array()
 	var palette: PackedInt32Array = PackedInt32Array()
@@ -311,6 +535,18 @@ func _rebuild() -> void:
 			if not colours.is_empty():
 				data[o + 7] = colours[i]
 			data[o + 15] = n
+		if not first_ramp_of.has(clip):
+			first_ramp_of[clip] = ramp_rows.size()
+			for ramp: PackedInt32Array in clip.ramps:
+				ramp_rows.append(ramp)
+				ramp_palettes.append(clip.palette)
+				longest_ramp = maxi(longest_ramp, ramp.size())
+		_first_ramp[n] = first_ramp_of[clip]
+		lights.append_array(clip.light_texels())
+		if clip.has_light():
+			brights.append_array(clip.brightness[mini(_turns[n], clip.brightness.size() - 1)])
+		else:
+			brights.resize(brights.size() + clip.splat_count) # never read: these splats have no ramp
 		splats += clip.splat_count
 		bone_total += clip.bone_count
 		# one palette for the picture: the first asset's background, then every colour once
@@ -324,6 +560,26 @@ func _rebuild() -> void:
 	data.resize(rows * _SPLATS_WIDTH * 4)
 	var splat_image: Image = Image.create_from_data(_SPLATS_WIDTH, rows, false, Image.FORMAT_RGBAF, data.to_byte_array())
 	_draw_material.set_shader_parameter(&"splats", ImageTexture.create_from_image(splat_image))
+
+	var light_rows: int = maxi(1, ceili(splats / float(_LIGHTS_WIDTH)))
+	lights.resize(light_rows * _LIGHTS_WIDTH * 4)
+	_draw_material.set_shader_parameter(&"lights", ImageTexture.create_from_image(
+			Image.create_from_data(_LIGHTS_WIDTH, light_rows, false, Image.FORMAT_RGBAF, lights.to_byte_array())))
+	var bright_rows: int = maxi(1, ceili(splats / float(_LIGHTS_WIDTH * 4)))
+	brights.resize(bright_rows * _LIGHTS_WIDTH * 4)
+	_draw_material.set_shader_parameter(&"brightness", ImageTexture.create_from_image(
+			Image.create_from_data(_LIGHTS_WIDTH, bright_rows, false, Image.FORMAT_RGBAF, brights.to_byte_array())))
+	var ramp_data: PackedFloat32Array = PackedFloat32Array()
+	ramp_data.resize(maxi(1, ramp_rows.size()) * longest_ramp * 4)
+	ramp_data.fill(0.0)
+	for r: int in ramp_rows.size():
+		var ramp: PackedInt32Array = ramp_rows[r]
+		for c: int in ramp.size():
+			var o: int = (r * longest_ramp + c) * 4
+			ramp_data[o] = SplatClip.pack(ramp_palettes[r][ramp[c]])
+			ramp_data[o + 1] = ramp.size()
+	_draw_material.set_shader_parameter(&"ramps", ImageTexture.create_from_image(
+			Image.create_from_data(longest_ramp, maxi(1, ramp_rows.size()), false, Image.FORMAT_RGBAF, ramp_data.to_byte_array())))
 
 	_instance_data.resize(maxi(1, instance_count) * _INSTANCE_FLOATS)
 	_instance_data.fill(0.0)

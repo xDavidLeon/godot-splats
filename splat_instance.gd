@@ -31,6 +31,11 @@ static var _clips: Dictionary[String, SplatClip] = {}
 ## surface (a rug, a poster), which the surface's own splats would otherwise hatch through.
 @export var depth_bias: float = 0.0
 
+## Whether it darkens the floor under it when the scene draws floor shadows
+## ([member SplatScene.floor_shadows]). Turn it off for the floor itself, for walls, and for what
+## lies on a surface.
+@export var casts_shadow: bool = true
+
 var _clip: SplatClip = null
 # endregion
 

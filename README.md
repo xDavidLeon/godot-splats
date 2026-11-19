@@ -4,7 +4,7 @@ Assets are written as code for ink-studio, built to "TCRS" `.bytes` files, and d
 
 | Part | Where |
 |---|---|
-| The Godot 4 addon (GDScript, no compute shaders) | this folder: `splat_clip.gd`, `splat_instance.gd`, `splat_scene.gd`, `shaders/` |
+| The Godot 4 addon (GDScript, no compute shaders) | this folder: `splat_clip.gd`, `splat_instance.gd`, `splat_scene.gd`, `splat_lamp.gd`, `splat_light.gd`, `shaders/` |
 | The file format's specification | [FORMAT.md](FORMAT.md) |
 | The asset tools (Node 18 or later; Godot ignores the folder) | `tools/build.js`, `tools/snap.js`, `tools/export.js` |
 | The pinned ink-studio they use (MIT, Shapeshift Labs) | `tools/ink-studio/`, see its `VENDORED.md` |
@@ -57,15 +57,26 @@ In the assembled project the addon is at `res://addons/splats`, and `dev/demo`, 
 
 `res://splats/demo/splat_demo.tscn` does exactly this; run it with F6.
 
+## Light
+
+A scene that sets none of this draws its assets' baked colours, as before. All of it needs the files' light data (props, and clips built with `"light": true`); a file without it keeps its colours.
+
+- **Lamps.** Put a `SplatLamp` (a `Node3D` with a `radius` in metres and a `strength`) under the scene's `instances_root`. The splats near it and facing it step up the colour ramp each was shaded on. It is not a Godot light: only the splat picture reads it, nothing blocks it, and it casts no shadow. `SplatScene.lamp_light` switches every lamp off. Up to 16 light one picture.
+- **Dusk.** `SplatScene.dusk` takes every splat down its own ramp by that many whole steps: 0 is the bake, 2 reads as evening. Splats with no ramp (glowing things: a lamp's shade, a screen) keep their colour. A lamp shows at dusk more than by day, when floors and walls are already at the top of their ramps.
+- **Floor shadows.** `SplatScene.floor_shadows` darkens the floor (`floor_height`) under every instance, away from `sun`. Keep `sun` equal to the sun the assets were baked with (the manifest's, or the exporter's default, which is the scene's default too). Turn `SplatInstance.casts_shadow` off for the floor itself, for walls, and for what lies on a surface. A shadow is a disc on every `shadow_cell` (5 cm) something stands over, and leaves `shadow_light` (0.8) of the light. Shadows fall within 12.8 m of where the camera looks.
+
+None of it costs a rebuild or any work on the CPU: the rules run in the shaders every frame, so a lamp or a piece of furniture can be dragged, the dusk can fall, and a clip's shadow follows its pose. The same rules are in script as `SplatLight` (`relight`, `added_by_lamps`, `colour_at`, `shadow_cells`), for anything that wants the answer outside the picture; the tests check those, and `dev/tools/splat_light_report.gd` checks the shaders against them.
+
 ## How it draws
 
 | Pass | Where | What |
 |------|-------|------|
-| Draw | `shaders/splat_scene_draw.gdshader`, in a 3D `SubViewport` at twice the art size | One quad a splat (a `MultiMesh`). The vertex shader poses each splat by its bone and its instance's transform. Nothing is sorted: solid splats are cut out at half their Gaussian and written with depth. |
-| Resolve | `shaders/splat_resolve.gdshader`, in a 2D `SubViewport` at the art size | ink-studio's palette and ink look: inside a shape, the palette colour nearest the average of a pixel's four samples (or the one they vote for); on a silhouette, the voted colour inked darker. Coverage is binary: alpha is 0 or 1. |
+| Shadow cells, only with floor shadows | `shaders/splat_shadow_cast.gdshader`, in a 3D `SubViewport` of 512 x 512 | The floor's grid from above, one texel a cell. The same quads as the draw pass: each splat is carried down the sun's ray and marks the cell it lands in. |
+| Draw | `shaders/splat_scene_draw.gdshader`, in a 3D `SubViewport` at twice the art size | One quad a splat (a `MultiMesh`). The vertex shader poses each splat by its bone and its instance's transform, and moves its colour along its ramp for the lamps and the dusk. Nothing is sorted: solid splats are cut out at half their Gaussian and written with depth. Then, with floor shadows, one quad (`shaders/splat_shadow.gdshader`) marks the samples that lie in a shadow, depth-tested against the splats. |
+| Resolve | `shaders/splat_resolve.gdshader`, in a 2D `SubViewport` at the art size | ink-studio's palette and ink look: inside a shape, the palette colour nearest the average of a pixel's four samples (or the one they vote for); on a silhouette, the voted colour inked darker. Samples in a floor shadow are darkened first, so a shadow takes the palette too. Coverage is binary: alpha is 0 or 1. |
 | Present | `shaders/splat_present.gdshader` | Nearest-neighbour scale-up, alpha clipped. |
 
-- **No compute or geometry shaders.** Splats, instances and bones are float textures read with `texelFetch` in the vertex shader. It runs in Forward+ and in the Compatibility renderer, with the same picture.
+- **No compute or geometry shaders.** Splats, instances, bones and light data are float textures read with `texelFetch` in the vertex shader. It runs in Forward+, Mobile and the Compatibility renderer, with the same picture.
 - **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed. The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn.
 
 ## Differences from the Unity renderer
@@ -74,6 +85,11 @@ In the assembled project the addon is at `res://addons/splats`, and `dev/demo`, 
 - **A second look for the inside of a shape** (`SplatScene.interior`). The default, `AVERAGE`, is Unity's: the palette colour nearest the average of a pixel's four samples, with an ordered dither. An average of two tones can be nearest a colour that is in neither, which shows as stray pixels in dark hair. `VOTE` takes the colour most samples vote for instead (a tie goes to the one nearest the average; in the average look the silhouette's tie goes to the first sample read; both as in the Unity shader): no strays, no dither, flatter, and less flicker in motion. The average is the default. `dev/comparisons/finding-interior-colour.png` shows ink-studio, the average and the vote; `dev/comparisons/motion-*.gif` show both in motion (average left, vote right), captured by `dev/tools/splat_motion.gd`. The demo's switch, or Tab, flips between them.
 - **A prop's quarter turn** is counted in Unity's yaw in the file. `SplatClip.turn_of` converts from Godot's: +90 degrees about y is the file's set 3.
 - **`.bytes` files are not Godot resources.** They are read with `FileAccess`. An export preset must list `*.bytes` under "Filters to export non-resource files".
+- **Lamps, dusk and floor shadows are worked out on the GPU every frame.** The Unity renderer worked them out on the CPU and rebuilt its buffers whenever a lamp or a thing that casts a shadow moved. So here:
+  - A clip is lit and casts its shadow as it is posed; in Unity, as the file holds it at rest.
+  - Moving a lamp or a shadow rebuilds nothing, and there is no count of how many splats a lamp changed.
+  - A shadow is marked in the samples and darkened by the pixel look, where Unity multiplied the samples' colour. The colours come out the same.
+  - Floor shadows are off until `floor_shadows` is set, and the sun, the floor's height, a lamp's reach and strength are the scene's and the lamp's own properties.
 
 ## Web export
 
@@ -104,7 +120,7 @@ Tried on 2026-11-18 with Godot 4.7.2: the demo scene, exported for the web (sing
 
 ## Not ported
 
-Floor shadows, relighting by lamps and dusk (the light data is read but not used), the wardrobe (`LOOK`) and extra clips (`CLPS`): both sections are read past, clip cross-fades, particles, and the editing overlays (the tinted ghost and the marks).
+The wardrobe (`LOOK`) and extra clips (`CLPS`): both sections are read past, clip cross-fades, particles, and the editing overlays (the tinted ghost and the marks).
 
 ## Checking it
 
@@ -117,6 +133,14 @@ godot --path <folder> --rendering-method gl_compatibility -s res://splats/tools/
 ```
 
 The test runner runs every `test_*.gd` in `dev/tests`. The last two need a window. They write `splats/comparisons/` in the assembled project (the ones worth keeping are copied by hand to `dev/comparisons/`): each sample asset beside ink-studio's own render of it (`splats/reference/`), the demo scene, and the demo's splat count and frame time.
+
+The light has a report of its own. It needs a window too, and a furnished room's assets, which this repository does not hold: hand a folder of them to `make_project.py --samples`.
+
+```sh
+godot --path <folder> -s res://splats/tools/splat_light_report.gd -- --reference=<folder of reference renders> --look=vote
+```
+
+It draws a room by day, at dusk and with a lamp, beside reference renders of the same room when it is given some, checks the shaders' light against `SplatLight`'s rules, and measures a frame and a rebuild.
 
 ## Licence
 

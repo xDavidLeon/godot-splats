@@ -76,6 +76,8 @@ var skipped_sections: PackedStringArray = PackedStringArray()
 ## The mark of a section this reader does not know, or empty. Sections carry no length, so reading
 ## stops there; everything before it is intact.
 var unknown_section: String = ""
+
+var _light_texels: PackedFloat32Array = PackedFloat32Array()
 # endregion
 
 
@@ -88,6 +90,29 @@ func is_prop() -> bool:
 ## True when the file carries light data.
 func has_light() -> bool:
 	return not ramps.is_empty()
+
+
+## Four floats per splat, as [SplatScene] hands them to its shader: the splat's normal, then the ramp
+## it was shaded on, or -1 for one that keeps its colour (every splat of a file with no light data).
+## Made once and kept.
+func light_texels() -> PackedFloat32Array:
+	if _light_texels.size() == splat_count * 4:
+		return _light_texels
+	_light_texels.resize(splat_count * 4)
+	var lit: bool = has_light()
+	for i: int in splat_count:
+		var o: int = i * 4
+		if lit:
+			_light_texels[o] = normals[i * 3]
+			_light_texels[o + 1] = normals[i * 3 + 1]
+			_light_texels[o + 2] = normals[i * 3 + 2]
+			_light_texels[o + 3] = ramp_of[i]
+		else:
+			_light_texels[o] = 0.0
+			_light_texels[o + 1] = 0.0
+			_light_texels[o + 2] = 0.0
+			_light_texels[o + 3] = -1.0
+	return _light_texels
 
 
 ## The clip's length in seconds; 0 for a prop.

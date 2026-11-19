@@ -8,16 +8,19 @@
 // colour too. An average of two tones can be nearest a palette colour that is in neither, which shows
 // as stray pixels (dark red and blue-grey in dark hair); the vote has none, and no dither, and looks
 // flatter. The average is the default.
-// Not ported: the edit marks (samples with alpha 0.5).
+// Floor shadows: a covered sample with an alpha of a half lies in a shadow (splat_shadow.gdshader
+// marked it), and is darkened here before anything else looks at it.
+// Not ported: the edit marks (which the Unity shader also marks with an alpha of 0.5).
 // Drawn on a rectangle that fills a viewport of the art's size.
 shader_type canvas_item;
 render_mode unshaded, blend_disabled;
 
-uniform sampler2D samples : filter_nearest, repeat_disable; // twice the art resolution: rgb, coverage in alpha
+uniform sampler2D samples : filter_nearest, repeat_disable; // twice the art resolution: rgb, coverage in alpha (a half: covered and in a floor shadow)
 uniform vec3 pal[128];                                       // sRGB, 0..1; index 0 is the background
 uniform int pal_count = 1;
 uniform bool average_interior = true;  // inside a shape: the palette colour nearest the samples' average, or the vote
 uniform float dither = 0.021;          // only with average_interior: ordered noise added to the average
+uniform float shadow_light = 0.8;      // how much light a floor shadow leaves
 
 const float BAYER[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
 
@@ -67,6 +70,11 @@ void fragment() {
 	vec3 native = vec3(0.0);
 	for (int i = 0; i < 4; i++) {
 		vec4 s = texelFetch(samples, clamped(p * 2 + ivec2(i & 1, i >> 1)), 0);
+		if (s.a > 0.25 && s.a < 0.75) {
+			// in a floor shadow: a share of its light, rounded as an 8-bit target rounds it (the Unity
+			// renderer darkened the samples in one)
+			s.rgb = floor(s.rgb * shadow_light * 255.0 + 0.5) / 255.0;
+		}
 		solid[i] = s.a > COVERED_ABOVE;
 		labels[i] = nearest(s.rgb, solid[i]);
 		native += s.rgb * 0.25;

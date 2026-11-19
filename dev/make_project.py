@@ -25,6 +25,8 @@ Then, with a Godot 4.7 binary (the standard build is enough; exporting needs its
     godot --path <folder> --headless -s res://tests/test_runner.gd  every dev/tests/test_*.gd
     godot --path <folder>                                           the demo, or the overlay with --overlay
     godot --path <folder> -s res://splats/tools/splat_report.gd     captures beside ink-studio's renders; needs a window
+    godot --path <folder> -s res://splats/tools/splat_light_report.gd   lamps, dusk and floor shadows in a room; needs a
+                                                                    window, and a room's assets given with --samples
 
 --overlay makes the project for the transparent click-through window: its main scene is the overlay
 and it has the two project settings that window needs, which are read at start-up. Run it with

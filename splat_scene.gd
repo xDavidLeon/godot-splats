@@ -25,13 +25,24 @@
 ## furniture that moves, the dusk falling and a clip playing cost the CPU nothing and rebuild nothing.
 ## Only files with light data are lit again ([method SplatClip.has_light]); the others keep their colours.
 ##
-## Not ported from Unity: particles and the editing overlays.
+## [b]Particles.[/b] An instance with a [member SplatInstance.motion] is a cloud whose splats each move
+## by themselves, by a formula of the clock ([SplatParticles]), in the vertex shader. Nothing is
+## simulated, uploaded or rebuilt for them, and a frame at a given time is always the same frame.
+##
+## [b]Marks.[/b] [method set_marks] draws lines into the picture on top of what lies under them, in
+## colours of their own that the pixel look leaves alone: an editor's grid, an outline round a thing.
+##
+## Not ported from Unity: the tinted ghost.
 # In Unity, the draw is a CommandBuffer with DrawProcedural and StructuredBuffers, and lamps, dusk
 # and shadows were worked out on the CPU at each rebuild. Here SubViewports do it: a 3D one (it has a
 # depth buffer) holding one MultiMesh of quads, a 2D one for the resolve, and, only while floor
 # shadows are on, a small 3D one for the floor's grid. None needs compute shaders, so the
 # Compatibility renderer can run it. Unity's instance made a new clip holding only the shown splats for
 # every look, and the scene rebuilt its buffers; here the pieces not worn are skipped by the shader.
+# Unity drew a mark's quad straight into the samples with an alpha of a half. Here that alpha is the
+# floor shadows', and a spatial shader cannot replace a colour and its alpha in one draw, so the marks
+# are drawn twice: once into the samples to clear what they cover, once into a target of their own
+# for their colours (splat_marks.gdshaderinc).
 class_name SplatScene
 extends Node
 
@@ -41,6 +52,8 @@ const DRAW_SHADER: Shader = preload("res://addons/splats/shaders/splat_scene_dra
 const RESOLVE_SHADER: Shader = preload("res://addons/splats/shaders/splat_resolve.gdshader")
 const SHADOW_CAST_SHADER: Shader = preload("res://addons/splats/shaders/splat_shadow_cast.gdshader")
 const SHADOW_SHADER: Shader = preload("res://addons/splats/shaders/splat_shadow.gdshader")
+const MARK_CUT_SHADER: Shader = preload("res://addons/splats/shaders/splat_mark_cut.gdshader")
+const MARK_COLOUR_SHADER: Shader = preload("res://addons/splats/shaders/splat_mark_colour.gdshader")
 
 ## Colours the pixel look can tell apart in one picture.
 const MAX_PALETTE: int = 128
@@ -51,11 +64,17 @@ const MAX_INSTANCES: int = 4096
 ## Floor shadows fall within this many cells of where the camera looks, each way: 12.8 m with the
 ## default [member shadow_cell].
 const SHADOW_REACH_CELLS: int = 256
+## Lines one picture draws. More are left out, with a warning.
+const MAX_MARKS: int = 4096
+## The particles' clock starts again after this many seconds, so a float keeps its precision.
+const CLOCK_WRAP: float = 3600.0
 
 const _SPLATS_WIDTH: int = 1024       # texels in a row: 256 splats
 const _BONES_WIDTH: int = 768         # texels in a row: 256 bones
 const _LIGHTS_WIDTH: int = 1024       # texels in a row: 1024 splats' normals and ramps, or 4096 splats' brightness
-const _INSTANCE_FLOATS: int = 16
+const _INSTANCE_FLOATS: int = 20
+const _MARK_FLOATS: int = 16
+const _MARK_DEPTH_BIAS: float = 0.1   # metres nearer the camera the marks are depth-tested
 const _SHADOW_HEIGHT: float = 0.004   # metres above the floor the shadow discs lie
 const _SHADOW_DEPTH_BIAS: float = 0.1 # metres nearer the camera they are depth-tested
 const _SHADOW_DISC: float = 0.75      # a disc's radius, in cells: neighbours overlap
@@ -114,7 +133,11 @@ enum Interior {
 @export_range(0.4, 1.0, 0.01) var shadow_light: float = 0.8
 
 @export_group("")
-## The clips' clock in seconds. Negative: the engine's own time.
+## How wide the lines of [method set_marks] are, in art pixels (with a perspective camera, at one
+## metre from it).
+@export_range(0.5, 8.0, 0.1) var mark_width: float = 1.6
+
+## The clips' and the particles' clock in seconds. Negative: the engine's own time.
 @export var fixed_time: float = -1.0
 
 ## Have the engine time both passes, for [method get_render_msec]. Off by default: timing has a cost.
@@ -135,6 +158,10 @@ var lamp_count: int = 0
 var rebuild_count: int = 0
 ## How many times an instance's look has been written again without a rebuild.
 var look_update_count: int = 0
+## Lines drawn over the picture ([method set_marks]).
+var mark_count: int = 0
+## How many times the lines have been handed to the GPU: only when they differ.
+var mark_upload_count: int = 0
 ## What the last frame cost this script, in milliseconds (uploads included, the GPU's work not).
 var last_cpu_msec: float = 0.0
 ## What the last rebuild cost, in milliseconds.
@@ -177,6 +204,15 @@ var _shadow_cast_material: ShaderMaterial
 var _shadow_material: ShaderMaterial
 var _shadow_plane: MeshInstance3D
 var _warned_sun: bool = false
+var _mark_data: PackedFloat32Array = PackedFloat32Array()
+var _mark_rows: int = 0
+var _marks_changed: bool = false
+var _mark_texture: ImageTexture
+var _mark_multimesh: MultiMesh
+var _marks_viewport: SubViewport
+var _mark_cut_material: ShaderMaterial
+var _mark_colour_material: ShaderMaterial
+var _mark_cut: MultiMeshInstance3D
 # endregion
 
 
@@ -197,7 +233,7 @@ func get_picture() -> ViewportTexture:
 
 
 ## The picture before the pixel look: twice the art resolution, coverage in alpha (a half where a
-## floor shadow falls on something). For debugging.
+## floor shadow falls on something, and none where a mark lies over it). For debugging.
 func get_samples() -> ViewportTexture:
 	return _samples_viewport.get_texture()
 
@@ -220,6 +256,41 @@ func get_shadow_first_cell() -> Vector2i:
 		if t > 0.0:
 			focus += forward * t
 	return Vector2i(floori(focus.x / shadow_cell), floori(focus.z / shadow_cell)) - Vector2i.ONE * SHADOW_REACH_CELLS
+
+
+## The lines to draw from now on, on top of what lies under them; none with an empty array. They are
+## outside the palette and the pixel look leaves them alone, so showing them never changes a colour
+## of anything else, and every pixel of the picture stays covered or clear. A thing standing in
+## front of a line hides it. Where lines cross, the one given last shows.
+## [br]Cheap to call every frame: the lines are handed to the GPU only when they differ, and they
+## never rebuild the scene.
+func set_marks(marks: Array[SplatMark]) -> void:
+	var count: int = marks.size()
+	if count > MAX_MARKS:
+		push_warning("[SplatScene] %d marks; one picture draws %d." % [count, MAX_MARKS])
+		count = MAX_MARKS
+	if count != mark_count:
+		_marks_changed = true
+	mark_count = count
+	if _mark_data.size() < count * _MARK_FLOATS:
+		_mark_data.resize(count * _MARK_FLOATS)
+		_marks_changed = true
+	for i: int in count:
+		var line: SplatMark = marks[i]
+		var o: int = i * _MARK_FLOATS
+		_put_mark(o, line.from.x)
+		_put_mark(o + 1, line.from.y)
+		_put_mark(o + 2, line.from.z)
+		_put_mark(o + 4, line.to.x)
+		_put_mark(o + 5, line.to.y)
+		_put_mark(o + 6, line.to.z)
+		_put_mark(o + 8, line.normal.x)
+		_put_mark(o + 9, line.normal.y)
+		_put_mark(o + 10, line.normal.z)
+		_put_mark(o + 12, line.colour.r8 / 255.0)
+		_put_mark(o + 13, line.colour.g8 / 255.0)
+		_put_mark(o + 14, line.colour.b8 / 255.0)
+		_put_mark(o + 15, 1.0 if line.is_dotted() else 0.0)
 
 
 ## Uploads what the picture needs for the clock at [param seconds]. [method _process] calls it; the
@@ -264,6 +335,10 @@ func draw(seconds: float) -> void:
 		_instance_data[o + 13] = _first_ramp[i]
 		_instance_data[o + 14] = instance.depth_bias
 		_instance_data[o + 15] = 1.0 if instance.casts_shadow else 0.0
+		_instance_data[o + 16] = instance.motion
+		_instance_data[o + 17] = instance.motion_reach
+		_instance_data[o + 18] = instance.motion_wobble
+		_instance_data[o + 19] = instance.motion_speed
 		var clip: SplatClip = instance.get_clip()
 		if clip.bone_count == 0:
 			continue
@@ -276,7 +351,7 @@ func draw(seconds: float) -> void:
 		look_update_count += 1
 		_upload_looks()
 	if not _instances.is_empty():
-		_instance_texture.update(Image.create_from_data(4, _instances.size(), false, Image.FORMAT_RGBAF, _instance_data.to_byte_array()))
+		_instance_texture.update(Image.create_from_data(_INSTANCE_FLOATS / 4, _instances.size(), false, Image.FORMAT_RGBAF, _instance_data.to_byte_array()))
 	if bones_changed:
 		_bone_texture.update(Image.create_from_data(_BONES_WIDTH, _bone_rows, false, Image.FORMAT_RGBAF, _bone_data.to_byte_array()))
 
@@ -288,19 +363,21 @@ func draw(seconds: float) -> void:
 	_draw_material.set_shader_parameter(&"view", camera.global_transform.affine_inverse())
 	_draw_material.set_shader_parameter(&"size", Vector2(art_size * 2))
 	_draw_material.set_shader_parameter(&"lens", lens_vector)
+	_draw_material.set_shader_parameter(&"clock", fmod(seconds, CLOCK_WRAP))
 	_light(lens_vector)
+	_mark(lens_vector)
 	_resolve_material.set_shader_parameter(&"average_interior", interior == Interior.AVERAGE)
 	_resolve_material.set_shader_parameter(&"dither", dither)
 	last_cpu_msec = (Time.get_ticks_usec() - started) / 1000.0
 
 
-## What the passes (the floor's shadow cells when they are on, draw and resolve) cost last frame, in
+## What the passes (the floor's shadow cells when they are on, draw, the marks' and resolve) cost last frame, in
 ## milliseconds: x on the CPU, y on the GPU. Zero unless [member measure_render_time] is on.
 func get_render_msec() -> Vector2:
 	if not measure_render_time or _samples_viewport == null:
 		return Vector2.ZERO
 	var total: Vector2 = Vector2.ZERO
-	for viewport: SubViewport in [_shadow_viewport, _samples_viewport, _picture_viewport]:
+	for viewport: SubViewport in [_shadow_viewport, _samples_viewport, _marks_viewport, _picture_viewport]:
 		if viewport == null or viewport.render_target_update_mode == SubViewport.UPDATE_DISABLED:
 			continue
 		total.x += RenderingServer.viewport_get_measured_render_time_cpu(viewport.get_viewport_rid())
@@ -319,8 +396,8 @@ func shown_splat_count() -> int:
 
 ## One line on what the picture holds and costs.
 func status() -> String:
-	return "%d splats (%d shown) in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
-		splat_count, shown_splat_count(), instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off",
+	return "%d splats (%d shown) in %d instances, %d colours, %d lamps, dusk %d, floor shadows %s, %d marks, art %dx%d; CPU %.3f ms a frame, last rebuild %.1f ms" % [
+		splat_count, shown_splat_count(), instance_count, palette_count, lamp_count, dusk, "on" if _shadows_wanted() else "off", mark_count,
 		art_size.x, art_size.y, last_cpu_msec, last_rebuild_msec]
 # endregion
 
@@ -369,6 +446,7 @@ func _light(lens_vector: Vector4) -> void:
 	_shadow_cast_material.set_shader_parameter(&"slope", Vector2(sun.x, sun.z) / sun.y)
 	_shadow_cast_material.set_shader_parameter(&"grid", Vector4(shadow_cell, floor_height, SplatLight.SHADOW_MIN_HEIGHT, across))
 	_shadow_cast_material.set_shader_parameter(&"first_cell", first_cell)
+	_shadow_cast_material.set_shader_parameter(&"clock", _draw_material.get_shader_parameter(&"clock"))
 	_shadow_material.set_shader_parameter(&"eye", camera.global_transform)
 	_shadow_material.set_shader_parameter(&"size", Vector2(art_size * 2))
 	_shadow_material.set_shader_parameter(&"lens", lens_vector)
@@ -425,12 +503,7 @@ func _build_shadow_pass() -> void:
 	casters.ignore_occlusion_culling = true
 	_shadow_viewport.add_child(casters)
 
-	var quad: ArrayMesh = ArrayMesh.new()
-	var arrays: Array = []
-	arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-1, -1, 0), Vector3(1, -1, 0), Vector3(1, 1, 0), Vector3(-1, 1, 0)])
-	arrays[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2, 0, 2, 3])
-	quad.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	var quad: ArrayMesh = _quad_mesh()
 	_shadow_material = ShaderMaterial.new()
 	_shadow_material.shader = SHADOW_SHADER
 	_shadow_material.set_shader_parameter(&"cells", _shadow_viewport.get_texture())
@@ -442,6 +515,117 @@ func _build_shadow_pass() -> void:
 	_shadow_plane.ignore_occlusion_culling = true
 	_samples_viewport.add_child(_shadow_plane)
 	RenderingServer.viewport_set_measure_render_time(_shadow_viewport.get_viewport_rid(), measure_render_time)
+# endregion
+
+
+# region Marks
+func _put_mark(at: int, value: float) -> void:
+	var before: float = _mark_data[at]
+	_mark_data[at] = value # kept in single precision: compared as it is kept
+	if _mark_data[at] != before:
+		_marks_changed = true
+
+
+# This frame's lines: their texture when they differ, and a few uniforms. Nothing when there are none.
+func _mark(lens_vector: Vector4) -> void:
+	_resolve_material.set_shader_parameter(&"mark_samples", mark_count > 0)
+	if mark_count > 0 and _marks_viewport == null:
+		_build_mark_pass()
+	if _marks_viewport == null:
+		return
+	_marks_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if mark_count > 0 else SubViewport.UPDATE_DISABLED
+	_mark_cut.visible = mark_count > 0
+	if mark_count == 0:
+		return
+	if _marks_changed:
+		_marks_changed = false
+		mark_upload_count += 1
+		# a row a line; the texture and the quads grow by doubling, and never shrink
+		if _mark_rows < mark_count:
+			_mark_rows = maxi(16, _mark_rows)
+			while _mark_rows < mark_count:
+				_mark_rows *= 2
+			_mark_texture = null
+			_mark_multimesh.instance_count = _mark_rows
+			var transforms: PackedFloat32Array = PackedFloat32Array()
+			transforms.resize(_mark_rows * 12)
+			_mark_multimesh.buffer = transforms # never read: the quads take only their number
+		var data: PackedFloat32Array = _mark_data.slice(0, mark_count * _MARK_FLOATS)
+		data.resize(_mark_rows * _MARK_FLOATS)
+		var image: Image = Image.create_from_data(_MARK_FLOATS / 4, _mark_rows, false, Image.FORMAT_RGBAF, data.to_byte_array())
+		if _mark_texture == null:
+			_mark_texture = ImageTexture.create_from_image(image)
+		else:
+			_mark_texture.update(image)
+		_mark_multimesh.visible_instance_count = mark_count
+	for material: ShaderMaterial in [_mark_cut_material, _mark_colour_material]:
+		material.set_shader_parameter(&"lines", _mark_texture)
+		material.set_shader_parameter(&"view", camera.global_transform.affine_inverse())
+		material.set_shader_parameter(&"size", Vector2(art_size * 2))
+		material.set_shader_parameter(&"lens", lens_vector)
+		# an art pixel is two samples, and the lens is samples to the metre: half a width, in metres
+		material.set_shader_parameter(&"mark", Vector2(mark_width / lens_vector.x, _MARK_DEPTH_BIAS))
+
+
+# The lines' quads, drawn twice: over the samples, to clear what a line covers, and into a target of
+# the samples' size for their colours. Built the first time there is a line to draw.
+func _build_mark_pass() -> void:
+	_mark_multimesh = MultiMesh.new()
+	_mark_multimesh.transform_format = MultiMesh.TRANSFORM_3D
+	_mark_multimesh.mesh = _quad_mesh()
+	var everywhere: AABB = AABB(Vector3.ONE * -100000.0, Vector3.ONE * 200000.0)
+	_mark_multimesh.custom_aabb = everywhere
+
+	_mark_cut_material = ShaderMaterial.new()
+	_mark_cut_material.shader = MARK_CUT_SHADER
+	_mark_cut = MultiMeshInstance3D.new()
+	_mark_cut.multimesh = _mark_multimesh
+	_mark_cut.material_override = _mark_cut_material
+	_mark_cut.custom_aabb = everywhere
+	_mark_cut.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_mark_cut.ignore_occlusion_culling = true
+	_samples_viewport.add_child(_mark_cut)
+
+	_marks_viewport = SubViewport.new()
+	_marks_viewport.name = "Marks"
+	_marks_viewport.own_world_3d = true
+	_marks_viewport.transparent_bg = true
+	_marks_viewport.size = art_size * 2
+	_marks_viewport.msaa_3d = Viewport.MSAA_DISABLED
+	_marks_viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	_marks_viewport.use_taa = false
+	_marks_viewport.use_debanding = false
+	_marks_viewport.positional_shadow_atlas_size = 0
+	add_child(_marks_viewport)
+	move_child(_marks_viewport, _picture_viewport.get_index()) # before the picture, which reads it
+
+	var eye: Camera3D = Camera3D.new()
+	eye.environment = Environment.new()
+	_marks_viewport.add_child(eye)
+	eye.make_current()
+
+	_mark_colour_material = ShaderMaterial.new()
+	_mark_colour_material.shader = MARK_COLOUR_SHADER
+	var colours: MultiMeshInstance3D = MultiMeshInstance3D.new()
+	colours.multimesh = _mark_multimesh
+	colours.material_override = _mark_colour_material
+	colours.custom_aabb = everywhere
+	colours.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	colours.ignore_occlusion_culling = true
+	_marks_viewport.add_child(colours)
+	_resolve_material.set_shader_parameter(&"marks", _marks_viewport.get_texture())
+	RenderingServer.viewport_set_measure_render_time(_marks_viewport.get_viewport_rid(), measure_render_time)
+
+
+# A quad with its corners at -1 and 1.
+static func _quad_mesh() -> ArrayMesh:
+	var quad: ArrayMesh = ArrayMesh.new()
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-1, -1, 0), Vector3(1, -1, 0), Vector3(1, 1, 0), Vector3(-1, 1, 0)])
+	arrays[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2, 0, 2, 3])
+	quad.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return quad
 # endregion
 
 
@@ -468,13 +652,7 @@ func _build_passes() -> void:
 	_samples_viewport.add_child(eye)
 	eye.make_current()
 
-	var quad: ArrayMesh = ArrayMesh.new()
-	var arrays: Array = []
-	arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-1, -1, 0), Vector3(1, -1, 0), Vector3(1, 1, 0), Vector3(-1, 1, 0)])
-	arrays[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2, 0, 2, 3])
-	quad.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-
+	var quad: ArrayMesh = _quad_mesh()
 	_draw_material = ShaderMaterial.new()
 	_draw_material.shader = DRAW_SHADER
 	_draw_material.set_shader_parameter(&"splats_width", _SPLATS_WIDTH)
@@ -520,6 +698,8 @@ func _apply_measuring() -> void:
 	RenderingServer.viewport_set_measure_render_time(_picture_viewport.get_viewport_rid(), measure_render_time)
 	if _shadow_viewport != null:
 		RenderingServer.viewport_set_measure_render_time(_shadow_viewport.get_viewport_rid(), measure_render_time)
+	if _marks_viewport != null:
+		RenderingServer.viewport_set_measure_render_time(_marks_viewport.get_viewport_rid(), measure_render_time)
 
 
 # Gathers the instances and lays their splats end to end. Each splat's last float carries its instance.
@@ -530,6 +710,8 @@ func _rebuild() -> void:
 	_built_art_size = art_size
 	_samples_viewport.size = art_size * 2
 	_picture_viewport.size = art_size
+	if _marks_viewport != null:
+		_marks_viewport.size = art_size * 2
 	_resolve_rect.position = Vector2.ZERO
 	_resolve_rect.size = Vector2(art_size)
 
@@ -636,7 +818,7 @@ func _rebuild() -> void:
 	_instance_data.resize(maxi(1, instance_count) * _INSTANCE_FLOATS)
 	_instance_data.fill(0.0)
 	_instance_texture = ImageTexture.create_from_image(
-			Image.create_from_data(4, maxi(1, instance_count), false, Image.FORMAT_RGBAF, _instance_data.to_byte_array()))
+			Image.create_from_data(_INSTANCE_FLOATS / 4, maxi(1, instance_count), false, Image.FORMAT_RGBAF, _instance_data.to_byte_array()))
 	_draw_material.set_shader_parameter(&"instances", _instance_texture)
 
 	_bone_rows = maxi(1, ceili(bone_total * 3 / float(_BONES_WIDTH)))

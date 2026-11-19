@@ -4,7 +4,8 @@ Assets are written as code for ink-studio, built to "TCRS" `.bytes` files, and d
 
 | Part | Where |
 |---|---|
-| The Godot 4 addon (GDScript, no compute shaders) | this folder: `splat_clip.gd`, `splat_instance.gd`, `splat_scene.gd`, `splat_lamp.gd`, `splat_light.gd`, `shaders/` |
+| The Godot 4 addon (GDScript, no compute shaders) | this folder: `splat_clip.gd`, `splat_instance.gd`, `splat_scene.gd`, `splat_lamp.gd`, `splat_light.gd`, `splat_particles.gd`, `splat_mark.gd`, `shaders/` |
+| A debug panel for the pixel look, debug builds only | `debug/splat_debug_panel.gd` |
 | The file format's specification | [FORMAT.md](FORMAT.md) |
 | The asset tools (Node 18 or later; Godot ignores the folder) | `tools/build.js`, `tools/snap.js`, `tools/export.js` |
 | The pinned ink-studio they use (MIT, Shapeshift Labs) | `tools/ink-studio/`, see its `VENDORED.md` |
@@ -101,17 +102,75 @@ A scene that sets none of this draws its assets' baked colours, as before. All o
 
 None of it costs a rebuild or any work on the CPU: the rules run in the shaders every frame, so a lamp or a piece of furniture can be dragged, the dusk can fall, and a clip's shadow follows its pose. The same rules are in script as `SplatLight` (`relight`, `added_by_lamps`, `colour_at`, `shadow_cells`), for anything that wants the answer outside the picture; the tests check those, and `dev/tools/splat_light_report.gd` checks the shaders against them.
 
+## Particles
+
+Steam, flames and dust are splat assets like any other: a file says where the particles start and what colour they are. What makes one a cloud is its instance's motion:
+
+```gdscript
+steam.asset = "res://splats/fx/steam.bytes"
+steam.motion = SplatInstance.Motion.RISE     # or DRIFT, or NONE
+steam.motion_reach = 0.18                    # metres: how high a rise goes, how far a drift wanders
+steam.motion_wobble = 0.02                   # metres: how wide a rise wobbles on the way up
+steam.motion_speed = 1.0                     # how fast its clock runs against the scene's
+steam.casts_shadow = false
+```
+
+- **Rise** (steam, flames): each splat climbs `motion_reach` on a loop of its own length (2.8 to 7.6 seconds at speed 1), wobbling and shrinking to about half its size, and is gone for the first 4% of the loop and after a point between 75% and 100% of it that is its own.
+- **Drift** (dust): each splat wanders within `motion_reach` of where it starts, and is in view for half of a slower cycle of its own.
+- **Nothing is simulated, uploaded or rebuilt.** A splat's place is a formula of its own number in the picture and the clock, worked out in the vertex shader (`shaders/splat_pose.gdshaderinc`). The motion is four numbers in the instance's row; it can change every frame.
+- **The clock is the scene's** (`SplatScene.fixed_time`, or the engine's), so a frame at a given time is always the same frame. It starts again every hour (`SplatScene.CLOCK_WRAP`), where a cloud jumps once.
+- **A particle is solid like every splat here,** so where it would fade out it is dropped for that part of its loop. One smaller than a sample can fall between samples and miss a frame.
+- **The sample clouds glow:** they were shaded on no ramp, so lamps and dusk leave them alone. Turn `casts_shadow` off for a cloud; left on, its shadow follows its splats.
+- **The rule is in script too,** as `SplatParticles` (`offset_at`, `seed_of`, `rise_phase`, `rise_end`, `drift_shown`), worked in single precision as the shader works it. `dev/tools/splat_fx_report.gd` draws one cloud alone and looks for every splat where the rule puts it.
+- **Two renderers do not put every particle in the same place.** A particle's seed is a hash, and its last few bits are how the driver rounds it. On the one GPU tried (NVIDIA), Vulkan (Forward+, Mobile) rounds every step and OpenGL (Compatibility) adds the hash's products in before rounding; `SplatParticles.fused` picks which the script follows, and each matched its renderer for every splat. The clouds look the same; a capture is reproducible on one renderer and one GPU, not across them.
+
+`dev/samples/fx-steam.bytes`, `fx-flames.bytes` and `fx-dust.bytes` are three clouds (38, 270 and 130 splats); `dev/comparisons/fx-particles.gif` shows them in one scene.
+
+## Marks
+
+Lines drawn into the picture on top of what lies under them: an editor's grid, an outline round what is selected, the footprint of a thing being placed.
+
+```gdscript
+var lines: Array[SplatMark] = [SplatMark.new(from, to, Vector3.UP, Color8(244, 238, 222, 128))]   # alpha under 255: dotted
+lines.append_array(SplatMark.outline(centre, half_u, half_v, Vector3.UP, Color8(255, 217, 77)))    # four sides
+scene.set_marks(lines)      # every frame if you like; set_marks([]) takes them away
+```
+
+- **A line is a flat strip in the world:** from and to, the normal of the surface it lies on, and a colour. It is `SplatScene.mark_width` art pixels wide (1.6), and its ends go half a width further, so the sides of an outline meet at the corners.
+- **Its colour is its own.** The pixel look shows it as it is, outside the palette and never inked. A colour with an alpha under 255 is drawn on every other art pixel, for a lighter line; no line is see-through, and every pixel of the picture is still covered or clear (measured: of 57,600 pixels of `dev/comparisons/fx-marks.png` before it was scaled up, none has an alpha other than 0 or 255).
+- **A thing in front of a line hides it.** A line is depth-tested a tenth of a metre nearer the camera than it is, so the surface it lies on does not hatch through it; a line that passes behind a table leg's foot shows over the bottom of the leg for that reason.
+- **Lines never rebuild the scene** and are handed to the GPU only when they differ from the last ones. Up to 4096 (`SplatScene.MAX_MARKS`). Where lines cross, the one given last shows.
+- **Only the pixels a line covers change, nearly.** An art pixel shows a line when two or more of its four samples are the line's. With one, that sample goes through the pixel look with the others, so a pixel at a line's edge can take another palette colour: in the picture above the lines changed 3,804 pixels, and 998 of those took a colour that is not a line's. The Unity renderer does the same.
+- What lines mean is the caller's business: the addon knows nothing of grids, selections or furniture.
+
+## The debug panel
+
+`debug/splat_debug_panel.gd` (`SplatDebugPanel`) is a small panel for judging the pixel look while the game runs. It finds every `SplatScene` in the tree by itself.
+
+```gdscript
+SplatDebugPanel.add_to(self)    # null, and nothing made, in a release export
+```
+
+- **F1** shows and hides it (`toggle_key`). **V** switches the look between the average and the vote, with the panel closed too (`look_key`).
+- Its controls: the look, the dither (the average look only), and a slider for each picture's height in art pixels, 90 to 720, which keeps the picture's shape and takes effect on the next frame; "Reset art sizes" goes back to the sizes the pictures had when the panel found them. Nothing it changes is saved.
+- **It exists only in debug builds, and only where a game asks for it.** Nothing in the addon creates it or refers to it. `add_to` makes nothing when `OS.is_debug_build()` is false or its second argument (the game's own condition) is false, and a panel put in the tree some other way frees itself in a release build. Checked by exporting a scene that tries both: the release export made no panel either way, the debug export both.
+- The script itself is still in a release pack unless the game's export preset excludes `addons/splats/debug/*`. A game that does that must reach the panel by `load()` and only when the file is there, not by its class name.
+
+`dev/comparisons/fx-panel-average.png` and `fx-panel-vote.png` show it switching the look, and `fx-panel-art-90.png` a picture made 90 art pixels high.
+
 ## How it draws
 
 | Pass | Where | What |
 |------|-------|------|
 | Shadow cells, only with floor shadows | `shaders/splat_shadow_cast.gdshader`, in a 3D `SubViewport` of 512 x 512 | The floor's grid from above, one texel a cell. The same quads as the draw pass: each splat is carried down the sun's ray and marks the cell it lands in. |
-| Draw | `shaders/splat_scene_draw.gdshader`, in a 3D `SubViewport` at twice the art size | One quad a splat (a `MultiMesh`). The vertex shader poses each splat by its bone and its instance's transform, and moves its colour along its ramp for the lamps and the dusk. Nothing is sorted: solid splats are cut out at half their Gaussian and written with depth. Then, with floor shadows, one quad (`shaders/splat_shadow.gdshader`) marks the samples that lie in a shadow, depth-tested against the splats. |
-| Resolve | `shaders/splat_resolve.gdshader`, in a 2D `SubViewport` at the art size | ink-studio's palette and ink look: inside a shape, the palette colour nearest the average of a pixel's four samples (or the one they vote for); on a silhouette, the voted colour inked darker. Samples in a floor shadow are darkened first, so a shadow takes the palette too. Coverage is binary: alpha is 0 or 1. |
+| Draw | `shaders/splat_scene_draw.gdshader`, in a 3D `SubViewport` at twice the art size | One quad a splat (a `MultiMesh`). The vertex shader poses each splat by its bone and its instance's transform, moves it by itself if its instance is a particle cloud, and moves its colour along its ramp for the lamps and the dusk. Nothing is sorted: solid splats are cut out at half their Gaussian and written with depth. Then, with floor shadows, one quad (`shaders/splat_shadow.gdshader`) marks the samples that lie in a shadow, depth-tested against the splats. Then, with marks, one quad a line (`shaders/splat_mark_cut.gdshader`) clears the samples a line covers, depth-tested too. |
+| Marks' colours, only with marks | `shaders/splat_mark_colour.gdshader`, in a 3D `SubViewport` of the samples' size | The same quads again, with no depth: each line's colour. |
+| Resolve | `shaders/splat_resolve.gdshader`, in a 2D `SubViewport` at the art size | ink-studio's palette and ink look: inside a shape, the palette colour nearest the average of a pixel's four samples (or the one they vote for); on a silhouette, the voted colour inked darker. Samples in a floor shadow are darkened first, so a shadow takes the palette too. A sample that is clear in the samples and drawn in the marks' colours is a line's, and a pixel with two or more of them shows the line's colour as it is. Coverage is binary: alpha is 0 or 1. |
 | Present | `shaders/splat_present.gdshader` | Nearest-neighbour scale-up, alpha clipped. |
 
-- **No compute or geometry shaders.** Splats, instances, bones and light data are float textures read with `texelFetch` in the vertex shader. It runs in Forward+, Mobile and the Compatibility renderer, with the same picture.
-- **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed (every frame of a fade). The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn; a change of look or of clip does not rebuild it.
+- **No compute or geometry shaders.** Splats, instances, bones, light data and marks are float textures read with `texelFetch` in the vertex shader. It runs in Forward+, Mobile and the Compatibility renderer, with the same picture (but for about one pixel in a hundred where a sample sits between two palette colours, and for where some particles are in their loops: see "Particles").
+- **The CPU's work a frame** is the instance matrices and the bones of clips whose frame changed (every frame of a fade), and the marks when they differ. The splat texture is rebuilt only when an instance appears, goes, hides or turns a quarter turn; a change of look or of clip, a particle cloud and marks do not rebuild it.
+- **What particles and marks cost,** measured on an RTX 4070 SUPER in the Compatibility renderer, 76,228 splats at 320 x 180: the script 0.033 ms a frame and the passes 0.25 ms on the GPU; with four clouds (476 splats more) 0.035 ms and 0.26 ms; with 34 lines as well 0.039 ms and 0.27 ms, and 0.04 ms more of the engine's CPU time for the lines' own target. A rebuild of that scene takes 8.5 ms and neither causes one. The GPU figures are of a quiet run: on later runs the same scene with nothing added read anywhere from 0.45 to 1.4 ms, so at this size no GPU cost can be pinned on either.
 
 ## Differences from the Unity renderer
 
@@ -127,6 +186,9 @@ None of it costs a rebuild or any work on the CPU: the rules run in the shaders 
 - **A look is worn in the shader.** The Unity renderer made a new clip of only the shown splats, recoloured, for every look, and rebuilt its buffers. Here the whole wardrobe stays in the texture and a change of look writes a few rows. So an undressed instance is drawn whole, where Unity's picked the first piece of each kind by its name, and the scene's splat count includes the pieces not worn (`shown_splat_count()` leaves them out).
 - **A fade is timed by the caller.** The Unity instance started a 0.3 second eased fade itself whenever its clip changed. Here the instance is handed both clips, their times and the weight.
 - **An unknown section at the end of a file stops the read there and keeps what came before** (`SplatClip.unknown_section` names it). The Unity reader refused the file.
+- **Marks are drawn twice.** The Unity renderer drew a line's quad straight into the samples with blending off and an alpha of a half, which its pixel look read as "a mark". Here an alpha of a half is a floor shadow's, and a Godot spatial shader cannot replace a colour and its alpha in one draw. So the lines' quads are drawn once over the samples, to clear what they cover (depth-tested), and once into a target of their own for their colours; a sample clear in the first and drawn in the second is a line's. The picture is the same: a line shows over an empty background too, as in Unity. A line lying in a floor shadow is not darkened, as in Unity (`dev/tools/splat_fx_report.gd` counts the same line pixels with the shadows on).
+- **A particle's seed is the GPU's.** The formulas are the Unity shader's, number for number, with the seed taken from the splat's number in the scene as there. But the seed is a hash whose last bits depend on how a driver rounds, so the same cloud does not put each particle at the same point of its loop in Unity, in Forward+ and in Compatibility (see "Particles"). A cloud whose instance casts a floor shadow casts it where its splats are, since the shadow pass poses splats as the draw pass does (reasoned, not looked at); in Unity, where the file has them.
+- **The debug panel is asked for.** The Unity one created itself after every scene load when the game's debug tools were on, and was an immediate-mode window. Here a game calls `SplatDebugPanel.add_to`, and the panel is ordinary controls on a `CanvasLayer`. It lists every `SplatScene`; the Unity one also listed the pictures of that project's second renderer, which is not ported.
 - **One renderer.** The Unity project had a second one for a single avatar in a transparent window, which sorted its splats and blended them, and so could draw splats with a density below 1 as soft dabs. This one draws only solid splats. None of the 63 files that project built has a splat below density 1 (every one of 694,606 is solid), and nor has any sample here, so nothing is lost by it; a file that had some would be drawn without them. What does differ is the edge of a solid splat: blended there, cut out here, which the pixel look then resolves the same way.
 
 ## Web export
@@ -158,7 +220,7 @@ Tried on 2026-11-18 with Godot 4.7.2: the demo scene, exported for the web (sing
 
 ## Not ported
 
-Particles, and the editing overlays (the tinted ghost and the marks).
+The tinted ghost: in the Unity renderer an instance could be given a tint, and was then drawn in that colour on every other art pixel, for a thing being placed. Here a thing being placed is drawn as it is, with its footprint as marks.
 
 ## Checking it
 
@@ -179,6 +241,15 @@ godot --path <folder> -s res://splats/tools/splat_light_report.gd -- --reference
 ```
 
 It draws a room by day, at dusk and with a lamp, beside reference renders of the same room when it is given some, checks the shaders' light against `SplatLight`'s rules, and measures a frame and a rebuild.
+
+The particles, the marks and the debug panel have one, which needs a window and the samples (and stands its scene on a floor if `floor.bytes` was handed to `make_project.py --samples`):
+
+```sh
+godot --path <folder> -s res://splats/tools/splat_fx_report.gd -- --tag=compat
+godot --path <folder> --rendering-method forward_plus -s res://splats/tools/splat_fx_report.gd -- --tag=forward
+```
+
+It captures 48 frames of the three sample clouds in one scene, a frame with a dotted grid and two outlines, and the window with the panel open in each look. It checks the shader's particles against `SplatParticles`, that neither particles nor marks rebuild anything, that every pixel with marks is covered or clear, that a dotted line is on every other art pixel and that a thing in front hides a line, and that the panel's keys work; and it prints what a frame costs with and without. It passes in Compatibility, Forward+ and Mobile (2026-11-19, Windows, one NVIDIA GPU).
 
 The wardrobe and the clips have one too, which needs a window and nothing but the samples:
 

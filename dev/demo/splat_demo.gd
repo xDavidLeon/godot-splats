@@ -1,8 +1,9 @@
 ## Demo of the splat renderer ([SplatScene]): a desk set
-## with its typing avatar, a mug and a teapot on the desk, and a second desk set and avatar behind,
-## turned a quarter turn, all in one pixel-art picture. Run it by itself with F6.
+## with its typing avatar, a mug that steams and a teapot on the desk, and a second desk set and
+## avatar behind, turned a quarter turn, all in one pixel-art picture. Run it by itself with F6.
 ## The switch in the corner, or the Tab key, changes how the inside of a shape is coloured: the average
-## of the samples (the default, Unity's look) or the vote.
+## of the samples (the default, Unity's look) or the vote. In a debug build F1 opens the debug panel
+## ([SplatDebugPanel]), which changes the look, the dither and the art size.
 extends Node
 
 
@@ -35,9 +36,14 @@ func _ready() -> void:
 	_look.button_pressed = _scene.interior == SplatScene.Interior.VOTE
 	_look.toggled.connect(_on_look_toggled)
 	_show_look()
+	SplatDebugPanel.add_to(self) # nothing in a release build
 
 
 func _process(delta: float) -> void:
+	if _look.button_pressed != (_scene.interior == SplatScene.Interior.VOTE):
+		# the debug panel changed the look
+		_look.set_pressed_no_signal(_scene.interior == SplatScene.Interior.VOTE)
+		_show_look()
 	_next_status -= delta
 	if _next_status > 0.0 or _scene.rebuild_count == 0:
 		return

@@ -8,8 +8,10 @@
 // (its piece + 1), so 0 there is a splat of no piece. And where its colour is one of a colour region's,
 // the packed colour is -(1 + that colour's palette index).
 uniform sampler2D splats : filter_nearest, repeat_disable;
-// 16 floats an instance in 4 texels, one instance a row: its 3x4 object-to-world by rows, then
+// 20 floats an instance in 5 texels, one instance a row: its 3x4 object-to-world by rows, then
 //   (first bone, first ramp, depth bias in metres, 1 if it casts a floor shadow)
+//   (its motion: 0 none, 1 rise, 2 drift; how high a rise goes or how far a drift, in metres; how wide
+//    a rise wobbles; its speed)
 uniform sampler2D instances : filter_nearest, repeat_disable;
 // 12 floats a bone in 3 texels: every instance's bones for this frame, end to end
 uniform sampler2D bones : filter_nearest, repeat_disable;
@@ -18,6 +20,7 @@ uniform sampler2D bones : filter_nearest, repeat_disable;
 uniform sampler2D looks : filter_nearest, repeat_disable;
 uniform int splats_width = 1024; // texels in a row of the splat texture: a multiple of 4
 uniform int bones_width = 768;   // texels in a row of the bone texture: a multiple of 3
+uniform float clock = 0.0;       // seconds, for particles
 
 vec4 splat_texel(int splat, int part) {
 	int i = splat * 4 + part;
@@ -39,9 +42,48 @@ void bone(int index, out mat3 m, out vec3 t) {
 	t = c.yzw;
 }
 
+// three numbers in 0..1 from one, the same every frame: a particle's own seed
+vec3 particle_seed(float n) {
+	vec3 p = fract(vec3(n) * vec3(0.1031, 0.1030, 0.0973));
+	p += dot(p, p.yzx + 33.33);
+	return fract((p.xxy + p.yzz) * p.zyx);
+}
+
+// Particles: an instance can carry a motion, and then each of its splats moves by itself, by a formula
+// of its own number in the scene and the clock: a rise for steam and flames, a drift for dust. Nothing
+// is simulated or uploaded. A particle is solid like any splat, so where it would fade out it is
+// dropped for that part of its cycle. The rule is SplatParticles.offset_at (splat_particles.gd).
+//   p: where it is in its asset's space, moved here. scale: how much of its size it keeps.
+// False while it is not drawn.
+bool move_particle(int splat, vec4 motion, inout vec3 p, out float scale) {
+	scale = 1.0;
+	vec3 r = particle_seed(float(splat) + 3.0);
+	float reach = motion.y;
+	float wobble = motion.z;
+	float t = clock * motion.w;
+	if (motion.x < 1.5) {
+		// rise: up its height on a loop of its own length, wobbling, shrinking; gone at both ends
+		float k = fract(t * 0.22 * (0.6 + r.x) + r.y);
+		if (k < 0.04 || k > 0.75 + 0.25 * r.z) {
+			return false;
+		}
+		p.y += k * reach;
+		p.x += wobble * sin(9.0 * k + 40.0 * r.z) * k;
+		p.z += wobble * cos(7.0 * k + 40.0 * r.x) * k;
+		scale = 1.0 - 0.6 * k;
+		return true;
+	}
+	// drift: a slow wander round where it starts, in view for part of a slower cycle
+	if (0.5 * sin(t * (0.3 + 0.4 * r.z) + 60.0 * r.x) + 0.5 < 0.5) {
+		return false;
+	}
+	p += reach * vec3(sin(0.3 * t + 40.0 * r.x), sin(0.22 * t + 40.0 * r.y), cos(0.27 * t + 40.0 * r.z));
+	return true;
+}
+
 // A splat where it stands in the world this frame. False for one that is not drawn: a soft splat (the
 // renderer draws only solid ones), a hidden part (ink-studio parks it at y = -99), or a splat of a
-// wardrobe piece its instance does not wear.
+// wardrobe piece its instance does not wear, or a particle in the part of its cycle where it is gone.
 //   at: its centre. carry: what took its own space to the world's (its bone, then its instance), for
 //   its covariance and its normal. colour_packed: its colour. of_instance: its instance's last texel.
 bool pose_splat(int splat, out vec3 at, out mat3 cov, out mat3 carry, out float colour_packed, out vec4 of_instance) {
@@ -92,6 +134,15 @@ bool pose_splat(int splat, out vec3 at, out mat3 cov, out mat3 carry, out float 
 		}
 		p = posed;
 		carry = m;
+	}
+
+	vec4 motion = texelFetch(instances, ivec2(4, inst), 0);
+	if (motion.x > 0.5) {
+		float scale;
+		if (!move_particle(splat, motion, p, scale)) {
+			shown = false;
+		}
+		cov *= scale * scale;
 	}
 
 	mat3 world = by_rows(i0.xyz, i1.xyz, i2.xyz);

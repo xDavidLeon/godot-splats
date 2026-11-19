@@ -27,6 +27,15 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.45, 0.445, 0.02)
 script = ExtResource("3_instance")
 asset = "res://splats/samples/mug.bytes"
 
+[node name="Steam" type="Node3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.45, 0.535, 0.02)
+script = ExtResource("3_instance")
+asset = "res://splats/samples/fx-steam.bytes"
+casts_shadow = false
+motion = 1
+motion_reach = 0.18
+motion_wobble = 0.02
+
 [node name="Teapot" type="Node3D" parent="World"]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.42, 0.445, 0)
 script = ExtResource("3_instance")

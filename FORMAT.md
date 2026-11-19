@@ -1,6 +1,6 @@
 # The TCRS splat file format
 
-Format versions 1, 2 and 3. This document, revision 6 (2026-11-19): the format is unchanged; the two optional sections are spelled out as this addon's reader now reads them, and two reference files have them. Revision 5 was wording only. Revision 4 added whose sun a prop's four bakes are lit by.
+Format versions 1, 2 and 3. This document, revision 7 (2026-11-19): the format is unchanged; "Particle clouds" says what a cloud's file is, and three reference files are clouds. Revision 6 spelled out the two optional sections as this addon's reader reads them, and gave two reference files that have them. Revision 5 was wording only. Revision 4 added whose sun a prop's four bakes are lit by.
 
 A TCRS file (`.bytes`) holds one splat asset: a prop, or a boned character with a clip. It is written by `tools/export.js` in this repository from an ink-studio scene, and read by this addon's `splat_clip.gd`. The format was first read by a Unity renderer of the same design, which is why some of its conventions are Unity's.
 
@@ -100,13 +100,24 @@ A prop's four colour sets and four light sets are bakes with the world's one sun
 
 The sun is the game's own, not part of the format: the exporter takes it from the game's manifest (`"sun": [x, y, z]`, pointing at the sun, in ink-studio's space) and bakes set k with that sun turned by k quarter turns about y. A clip is baked once, under the same sun. A file does not record which sun it was baked with. Without one in the manifest the exporter uses its default, `[-0.3, 0.75, 0.6]`.
 
+## Particle clouds
+
+**Nothing in a file marks it as a particle cloud.** Steam, flames and dust are version 2 files like any prop: plain splats (kind 0, density 1 or more) where the particles start, in the colour they have. How they move is not in the file: the drawer is told, for each thing it draws, whether its splats move and how (in this addon, `SplatInstance.motion`). So any file can be drawn as a cloud, and a cloud's file drawn without a motion is a still puff.
+
+What the three reference clouds have in common is the art's choice, not the format's:
+
+- Each splat is small, about one art pixel of the picture it is meant for, because each moves by itself.
+- Every splat glows: its ramp is -1, and the file has no ramps (a count of 0), so nothing lights it again. Its four colour sets are the same colour, and its four brightness sets are there and not used.
+- The exporter writes the scene's whole palette, so a cloud's palette holds colours no splat of it has.
+
 ## Reference files
 
-Six files every reader must read identically, in `dev/samples/`:
+Nine files every reader must read identically, in `dev/samples/`:
 
 - `mug.bytes`, `teapot.bytes` and `desk-set.bytes`: version 2.
 - `avatar-b.bytes`: version 3, 8 bones, 240 frames, no optional section.
 - `avatar-a-stand.bytes`: version 3, 8 bones, with `LOOK` (13 pieces, 7 regions) and a `CLPS` that only names its one clip.
 - `avatar-a.bytes`: version 3, 9 bones, with `LOOK` (17 pieces, 7 regions) and `CLPS` (6 clips of 240 frames).
+- `fx-steam.bytes`, `fx-flames.bytes` and `fx-dust.bytes`: version 2, particle clouds of 38, 270 and 130 splats, each of one colour, with light data that has no ramp.
 
-`dev/tests/test_splat_clip.gd` holds numbers read from them with an independent script, checks skinning against the posed positions each file stores (for every clip of `avatar-a.bytes`), and builds small files of its own for what a reader must refuse.
+`dev/tests/test_splat_clip.gd` holds numbers read from the first six with an independent script, checks skinning against the posed positions each file stores (for every clip of `avatar-a.bytes`), and builds small files of its own for what a reader must refuse. `dev/tests/test_splat_particles.gd` holds the clouds' numbers, read the same way.

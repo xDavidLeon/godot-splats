@@ -10,6 +10,10 @@
 ## [method play] picks one, and [method cross_fade] shows two mixed, bone by bone. The instance keeps
 ## no clock and no fade of its own: whoever calls decides when a change of clip starts, how long it
 ## takes and how it eases, and hands in the weight.
+##
+## [b]Particles.[/b] With a [member motion] the asset is a cloud: steam, flames, dust. Each of its
+## splats moves by itself in the shader, on the scene's clock. A cloud's file is an ordinary prop:
+## where the particles start and what colour they are. Turn [member casts_shadow] off for one.
 # In Unity, this is the SplatInstance MonoBehaviour with a TextAsset; Godot has no TextAsset, so the
 # asset is a path to the .bytes file, read once and shared. Unity's instance made a new clip of the
 # shown splats for every look and timed its own fades (0.3 s, eased).
@@ -18,6 +22,18 @@ extends Node3D
 
 
 # region State
+## How the splats of a particle cloud move ([member motion]).
+enum Motion {
+	## It is not a cloud: its splats stay where the asset and its bones put them.
+	NONE,
+	## Steam and flames: each splat climbs [member motion_reach] on a loop of its own length,
+	## wobbling up to [member motion_wobble] and shrinking, and is gone at both ends.
+	RISE,
+	## Dust: each splat wanders [member motion_reach] round where it starts, in view for half of a
+	## slower cycle.
+	DRIFT,
+}
+
 ## Bumped whenever an instance appears, goes, hides or changes its asset, so scenes gather again.
 static var version: int = 0
 
@@ -51,6 +67,23 @@ static var _clips: Dictionary[String, SplatClip] = {}
 ## lies on a surface.
 @export var casts_shadow: bool = true
 
+@export_group("Particles")
+## How each splat of a particle cloud moves by itself, in the shader. [constant Motion.NONE] for
+## anything that is not a cloud. It costs the CPU nothing, may change every frame, and never
+## rebuilds the scene. The rule is [method SplatParticles.offset_at].
+@export var motion: Motion = Motion.NONE
+
+## How high a rise goes, or how far a drift wanders from where it starts, in metres of the asset's
+## own space.
+@export_range(0.0, 4.0, 0.001, "or_greater") var motion_reach: float = 0.0
+
+## A rise only: how wide it wobbles on the way up, in metres.
+@export_range(0.0, 1.0, 0.001, "or_greater") var motion_wobble: float = 0.0
+
+## How fast the cloud's clock runs against the scene's.
+@export var motion_speed: float = 1.0
+
+@export_group("")
 ## The time [member clip_name] is shown at, in seconds of that clip's own. Negative: the scene's
 ## clock plus [member time_offset].
 var clip_time: float = -1.0

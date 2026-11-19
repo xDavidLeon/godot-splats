@@ -10,7 +10,9 @@
 //     splat_light.gd). With no lamp and no dusk its baked colour is used and nothing more is read.
 // No compute or geometry shader.
 // The floor shadows are drawn after this, by splat_shadow.gdshader.
-// Not ported: particles (an instance's motion), the tinted ghost and the edit marks.
+// Particles (an instance's motion) move in splat_pose.gdshaderinc. The lines drawn over the picture
+// (marks) are splat_mark_cut.gdshader and splat_mark_colour.gdshader.
+// Not ported: the tinted ghost.
 shader_type spatial;
 render_mode unshaded, cull_disabled, skip_vertex_transform, shadows_disabled, fog_disabled;
 
